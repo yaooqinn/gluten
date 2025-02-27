@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
 
   build-bundle-macos:
-    needs: build-native-libaries
+    needs: build-native-libraries
     runs-on: macos-15
     steps:
       - name: Self-Checkout
@@ -150,4 +150,3 @@ jobs:
           path: |
             path: package/target
           retention-days: 7
-  
