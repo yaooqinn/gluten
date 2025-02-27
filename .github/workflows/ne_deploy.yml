@@ -28,12 +28,23 @@ concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}
   cancel-in-progress: true
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  CCACHE_DIR: "${{ github.workspace }}/.ccache"
+
 jobs:
   build-native-libraries:
     runs-on: ubuntu-22.04
     steps:
       - name: Self-Checkout
         uses: actions/checkout@v4
+      - name: Setup Cache
+        uses: actions/cache@v4
+        with:
+          path: '${{ env.CCACHE_DIR }}'
+          key: ccache-centos7-release-default-${{ github.sha }}
+          restore-keys: |
+            ccache-centos7-release-default-
       - name: Build Gluten native libraries
         run: |
           echo $GITHUB_WORKSPACE
@@ -44,7 +55,9 @@ jobs:
             bash -c "
               df -a
               cd /work
+              export CCACHE_DIR=/work/.ccache
               bash dev/ci-velox-buildstatic-centos-7.sh
+              ccache --show-stats
               mkdir -p /work/.m2/repository/org/apache/arrow/
               cp -r /root/.m2/repository/org/apache/arrow/* /work/.m2/repository/org/apache/arrow/
            "
