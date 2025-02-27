@@ -1,0 +1,107 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+name: Bundle NetEase Gluten
+
+on:
+  push:
+    branches:
+      - 'ne-deploy'
+  pull_request:
+    branches:
+      - 'ne-deploy'
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-native-libaries:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Self-Checkout
+        uses: actions/checkout@v4
+      - name: Build Gluten native libraries
+        run: |
+          echo $GITHUB_WORKSPACE
+          docker run \
+            --volume $GITHUB_WORKSPACE:/work \
+            --workdir /work \
+            apache/gluten:vcpkg-centos-7 \
+            bash -c "
+              df -a
+              cd /work
+              bash dev/ci-velox-buildstatic-centos-7.sh
+              mkdir -p /work/.m2/repository/org/apache/arrow/
+              cp -r /root/.m2/repository/org/apache/arrow/* /work/.m2/repository/org/apache/arrow/
+           "
+      - name: Upload native libs
+        uses: actions/upload-artifact@v4
+        with:
+          path: |
+            ./cpp/build/releases/
+          name: velox-native-lib-${{github.sha}}
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload arrow
+        uses: actions/upload-artifact@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.m2/repository/org/apache/arrow/
+          name: velox-arrow-jar-centos-7-${{github.sha}}
+          retention-days: 7
+          if-no-files-found: error
+
+  build-bundle-macos:
+    needs: build-native-libaries
+    runs-on: macos-15
+    steps:
+      - name: Self-Checkout
+        uses: actions/checkout@v4
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-native-lib-${{github.sha}}
+          path: ./cpp/build/releases/
+      - name: Download arrow
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-arrow-jar-centos-7-${{github.sha}}
+          path: /root/.m2/repository/org/apache/arrow/
+      - name: Setup JDK 17
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'adopt'
+          java-version: '17'
+          cache: 'maven'
+      - name: Build Gluten bundle
+        run: |
+          mvn clean install \
+            -Pspark-3.5 \
+            -Dhadoop.version=3.4.0 \
+            -Pbackends-velox \
+            -Pceleborn -Puniffle \
+            -DskipTests=true \
+            -Dmaven.javadoc.skip=true \
+            -Dmaven.scaladoc.skip=true \
+            -Dmaven.source.skip \
+      - name: Upload Gluten bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: velox-bundle-macos-${{github.sha}}
+          path: |
+            path: package/target
+          retention-days: 7
