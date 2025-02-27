@@ -105,7 +105,7 @@ jobs:
           cache: 'maven'
       - name: Build Gluten bundle
         run: |
-          mvn clean install \
+          mvn --no-transfer-progress clean install \
             -Pspark-3.5 \
             -Dhadoop.version=3.4.0 \
             -Pbackends-velox \
@@ -151,7 +151,7 @@ jobs:
           cache: 'maven'
       - name: Build Gluten bundle
         run: |
-          mvn clean install \
+          mvn --no-transfer-progress clean install \
             -Pspark-3.5 \
             -Dhadoop.version=3.4.0 \
             -Pbackends-velox \
