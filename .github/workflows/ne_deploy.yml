@@ -29,7 +29,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-native-libaries:
+  build-native-libraries:
     runs-on: ubuntu-22.04
     steps:
       - name: Self-Checkout
@@ -105,3 +105,49 @@ jobs:
           path: |
             path: package/target
           retention-days: 7
+
+  build-bundle-ubuntu:
+    needs: build-native-libraries
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        container: [ 'centos:7', 'centos:8', 'ubuntu-22.04' ]
+    container: ${{ matrix.container }}
+    steps:
+      - name: Self-Checkout
+        uses: actions/checkout@v4
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-native-lib-${{github.sha}}
+          path: ./cpp/build/releases/
+      - name: Download arrow
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-arrow-jar-centos-7-${{github.sha}}
+          path: /root/.m2/repository/org/apache/arrow/
+      - name: Setup JDK 17
+        uses: actions/setup-java@v2
+        with:
+          distribution: 'adopt'
+          java-version: '17'
+          cache: 'maven'
+      - name: Build Gluten bundle
+        run: |
+          mvn clean install \
+            -Pspark-3.5 \
+            -Dhadoop.version=3.4.0 \
+            -Pbackends-velox \
+            -Pceleborn -Puniffle \
+            -DskipTests=true \
+            -Dmaven.javadoc.skip=true \
+            -Dmaven.scaladoc.skip=true \
+            -Dmaven.source.skip \
+      - name: Upload Gluten bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: velox-bundle-${{ matrix.container }}-${{github.sha}}
+          path: |
+            path: package/target
+          retention-days: 7
+  
