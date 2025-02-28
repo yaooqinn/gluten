@@ -52,6 +52,7 @@
 
   <properties>
     <java.version>1.8</java.version>
+    <maven.version>3.6.3</maven.version>
     <maven.compiler.source>${java.version}</maven.compiler.source>
     <maven.compiler.target>${java.version}</maven.compiler.target>
     <caffeine.version>2.9.3</caffeine.version>
@@ -1585,7 +1586,7 @@
             <configuration>
               <rules>
                 <requireMavenVersion>
-                  <version>3.6.3</version>
+                  <version>${maven.version}</version>
                 </requireMavenVersion>
               </rules>
             </configuration>
