@@ -136,7 +136,7 @@ jobs:
     container: ${{ matrix.container }}
     steps:
       - name: Self-Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@@v2
       - name: Download native libs
         uses: actions/download-artifact@v4
         with:
@@ -168,5 +168,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: velox-bundle-${{ matrix.container }}-${{ matrix.java }}-${{github.sha}}
-          path: package/target
+          path: package/target/gluten-velox-bundle-*.jar
           retention-days: 7
