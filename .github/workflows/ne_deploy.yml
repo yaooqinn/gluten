@@ -127,7 +127,7 @@ jobs:
     strategy:
       matrix:
         container:
-#          - 'centos:7'
+          - 'centos:7'
           - 'centos:8'
           - ''
         java:
@@ -136,7 +136,7 @@ jobs:
     container: ${{ matrix.container }}
     steps:
       - name: Self-Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Download native libs
         uses: actions/download-artifact@v4
         with:
