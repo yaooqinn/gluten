@@ -154,6 +154,7 @@ jobs:
           cache: 'maven'
       - name: Build Gluten bundle
         run: |
+          ls -alR ${{ github.workspace }}/.m2/repository/
           ./dev/mvn --no-transfer-progress clean install \
             -Pspark-3.5 \
             -Dhadoop.version=3.4.0 \
