@@ -127,12 +127,13 @@ jobs:
     strategy:
       matrix:
         container:
-          - 'centos:7'
+#          - 'centos:7'
           - 'centos:8'
           - ''
         java:
           - '8'
           - '17'
+          - '21'
     container: ${{ matrix.container }}
     steps:
       - name: Self-Checkout
