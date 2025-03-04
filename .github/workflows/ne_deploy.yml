@@ -131,7 +131,7 @@ jobs:
         java:
           - '8'
           - '17'
-          - '21'
+#          - '21'
     container: centos:${{ matrix.container }}
     steps:
       - name: Self-Checkout
