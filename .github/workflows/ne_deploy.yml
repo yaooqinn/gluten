@@ -82,7 +82,7 @@ jobs:
     strategy:
       matrix:
         container:
-#          - 'centos:7'
+#          - '7'
           - '8'
         java:
           - '8'
@@ -126,6 +126,53 @@ jobs:
           name: velox-bundle-centos-${{ matrix.container }}-${{ matrix.java }}-${{github.sha}}
           path: package/target/gluten-velox-bundle-*.jar
           retention-days: 7
+
+  build-bundle-ubuntu:
+    needs: build-native-libraries
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        java:
+          - '8'
+          - '17'
+    steps:
+      - name: Self-Checkout
+        uses: actions/checkout@v4
+      - name: Download native libs
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-native-lib-${{github.sha}}
+          path: ./cpp/build/releases/
+      - name: Download arrow
+        uses: actions/download-artifact@v4
+        with:
+          name: velox-arrow-jar-centos-7-${{github.sha}}
+          path: /root/.m2/repository/org/apache/arrow/
+      - name: Setup JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ matrix.java }}
+          cache: 'maven'
+      - name: Build Gluten bundle
+        run: |
+          ./dev/mvn --no-transfer-progress clean install \
+            -Pspark-3.5 \
+            -Dhadoop.version=3.4.0 \
+            -Pbackends-velox \
+            -Pceleborn \
+            -Puniffle \
+            -DskipTests=true \
+            -Dmaven.javadoc.skip=true \
+            -Dmaven.scaladoc.skip=true \
+            -Dmaven.source.skip \
+      - name: Upload Gluten bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: velox-bundle-ubuntu-${{ matrix.java }}-${{github.sha}}
+          path: package/target/gluten-velox-bundle-*.jar
+          retention-days: 7
+
 
   build-bundle-macos:
     runs-on: macos-15
