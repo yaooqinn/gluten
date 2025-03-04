@@ -107,7 +107,8 @@ jobs:
 #            -Pspark-3.5 \
 #            -Dhadoop.version=3.4.0 \
 #            -Pbackends-velox \
-#            -Pceleborn -Puniffle \
+#            -Pceleborn \
+#            -Puniffle \
 #            -DskipTests=true \
 #            -Dmaven.javadoc.skip=true \
 #            -Dmaven.scaladoc.skip=true \
@@ -119,20 +120,20 @@ jobs:
 #          path: package/target
 #          retention-days: 7
 
-  build-bundle-ubuntu:
+  build-bundle-centos:
     needs: build-native-libraries
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         container:
 #          - 'centos:7'
-          - 'centos:8'
-#          - ''
+          - '8'
         java:
           - '8'
           - '17'
-#          - '21'
-    container: ${{ matrix.container }}
+          - '21'
+    container: centos:${{ matrix.container }}
+    env:
     steps:
       - name: Self-Checkout
         uses: actions/checkout@v4
@@ -158,7 +159,8 @@ jobs:
             -Pspark-3.5 \
             -Dhadoop.version=3.4.0 \
             -Pbackends-velox \
-            -Pceleborn -Puniffle \
+            -Pceleborn \
+            -Puniffle \
             -DskipTests=true \
             -Dmaven.javadoc.skip=true \
             -Dmaven.scaladoc.skip=true \
@@ -166,6 +168,6 @@ jobs:
       - name: Upload Gluten bundle
         uses: actions/upload-artifact@v4
         with:
-          name: velox-bundle-${{ matrix.container }}-${{ matrix.java }}-${{github.sha}}
+          name: velox-bundle-centos-${{ matrix.container }}-${{ matrix.java }}-${{github.sha}}
           path: package/target/gluten-velox-bundle-*.jar
           retention-days: 7
