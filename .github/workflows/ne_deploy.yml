@@ -133,7 +133,6 @@ jobs:
           - '17'
           - '21'
     container: centos:${{ matrix.container }}
-    env:
     steps:
       - name: Self-Checkout
         uses: actions/checkout@v4
