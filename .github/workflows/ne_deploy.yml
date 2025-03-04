@@ -175,10 +175,11 @@ jobs:
 
 
   build-bundle-macos:
-    runs-on: macos-15
     strategy:
       matrix:
         java: [ '8', '17' ]
+        os: [ macos-13, macos-14 ]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Self-Checkout
         uses: actions/checkout@v4
