@@ -302,6 +302,12 @@ abstract class MathFunctionsValidateSuite extends FunctionsValidateSuite {
     }
   }
 
+  testWithMinSparkVersion("randstr", "4.0") {
+    runQueryAndCompare("SELECT randstr(5, 0) from lineitem limit 100", compareResult = false) {
+      _ => // randstr is not yet supported by Velox, falls back to Spark
+    }
+  }
+
   test("rint") {
     withTempPath {
       path =>
