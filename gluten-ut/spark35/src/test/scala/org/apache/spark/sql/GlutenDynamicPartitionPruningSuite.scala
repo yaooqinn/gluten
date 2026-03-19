@@ -716,6 +716,38 @@ class GlutenDynamicPartitionPruningV1SuiteAEOn
       }
     }
   }
+
+  testGluten("multi-key DPP with columnar broadcast") {
+    withSQLConf(
+      SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+      SQLConf.ANSI_ENABLED.key -> "false"
+    ) {
+      withTable("fact_mk", "dim_mk") {
+        sql("""CREATE TABLE fact_mk (id BIGINT, value INT, a STRING, b STRING)
+              |USING parquet PARTITIONED BY (a, b)""".stripMargin)
+        sql(
+          "INSERT INTO fact_mk VALUES " +
+            (0 until 10).map(i => s"($i, 1, '1', '1')").mkString(", "))
+        sql(
+          "INSERT INTO fact_mk VALUES " +
+            (0 until 10).map(i => s"($i, 2, '2', '2')").mkString(", "))
+        sql(
+          "INSERT INTO fact_mk VALUES " +
+            (0 until 10).map(i => s"($i, 3, '3', '3')").mkString(", "))
+
+        sql("CREATE TABLE dim_mk (x STRING, y STRING, z INT) USING parquet")
+        sql("INSERT INTO dim_mk VALUES ('1', '1', 10), ('2', '2', 20)")
+
+        val df = sql("""SELECT f.id, f.a, f.b FROM fact_mk f
+                       |JOIN dim_mk d ON f.a = d.x AND f.b = d.y
+                       |WHERE d.z < 15""".stripMargin)
+
+        val result = df.collect()
+        assert(result.length == 10)
+        checkAnswer(df, result)
+      }
+    }
+  }
 }
 
 abstract class GlutenDynamicPartitionPruningV2Suite extends GlutenDynamicPartitionPruningSuiteBase {

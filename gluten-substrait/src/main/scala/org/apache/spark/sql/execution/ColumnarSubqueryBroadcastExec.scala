@@ -89,14 +89,35 @@ case class ColumnarSubqueryBroadcastExec(
             val relation = child.executeBroadcast[Any]().value
             relation match {
               case b: BuildSideRelation =>
-                val index = indices(0) // TODO(): fixme
-                // Transform columnar broadcast value to Array[InternalRow] by key.
-                if (canRewriteAsLongType(buildKeys)) {
-                  b.transform(HashJoin.extractKeyExprAt(buildKeys, index)).distinct
+                // Build key expressions for all indices (multi-key DPP support).
+                val keyExprs = if (canRewriteAsLongType(buildKeys)) {
+                  indices.map(idx => HashJoin.extractKeyExprAt(buildKeys, idx))
                 } else {
-                  b.transform(
-                    BoundReference(index, buildKeys(index).dataType, buildKeys(index).nullable))
-                    .distinct
+                  indices.map {
+                    idx =>
+                      BoundReference(
+                        idx,
+                        buildKeys(idx).dataType,
+                        buildKeys(idx).nullable): Expression
+                  }
+                }
+                if (keyExprs.size == 1) {
+                  b.transform(keyExprs.head).distinct
+                } else {
+                  // For multi-key DPP, pack all keys into a struct via transform(),
+                  // then flatten back to individual columns to match the expected
+                  // output schema (InSubqueryExec expects N-column rows).
+                  val structExpr = CreateStruct(keyExprs)
+                  val structRows = b.transform(structExpr)
+                  val structType = structExpr.dataType
+                  val flattenExprs = keyExprs.indices.map {
+                    i =>
+                      GetStructField(
+                        BoundReference(0, structType, nullable = true),
+                        i): Expression
+                  }
+                  val flatProj = UnsafeProjection.create(flattenExprs)
+                  structRows.map(r => flatProj(r).copy()).distinct
                 }
               case h: HashedRelation =>
                 val (iter, exprs) = if (h.isInstanceOf[LongHashedRelation]) {
