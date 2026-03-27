@@ -51,8 +51,6 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
     ResizeRange(minSize, Int.MaxValue)
   }
 
-  def veloxBloomFilterMaxNumBits: Long = getConf(COLUMNAR_VELOX_BLOOM_FILTER_MAX_NUM_BITS)
-
   def castFromVarcharAddTrimNode: Boolean = getConf(CAST_FROM_VARCHAR_ADD_TRIM_NODE)
 
   def enableVeloxFlushablePartialAggregation: Boolean =
@@ -60,6 +58,12 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def enableBroadcastBuildRelationInOffheap: Boolean =
     getConf(VELOX_BROADCAST_BUILD_RELATION_USE_OFFHEAP)
+
+  def enableBroadcastBuildOncePerExecutor: Boolean =
+    getConf(VELOX_BROADCAST_BUILD_HASHTABLE_ONCE_PER_EXECUTOR)
+
+  def veloxBroadcastHashTableBuildThreads: Int =
+    getConf(COLUMNAR_VELOX_BROADCAST_HASH_TABLE_BUILD_THREADS)
 
   def veloxOrcScanEnabled: Boolean =
     getConf(VELOX_ORC_SCAN_ENABLED)
@@ -82,9 +86,19 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def cudfBatchSize: Int = getConf(CUDF_BATCH_SIZE)
 
+  def cudfShuffleMaxPrefetchBytes: Long = getConf(CUDF_SHUFFLE_MAX_PREFETCH_BYTES)
+
   def orcUseColumnNames: Boolean = getConf(ORC_USE_COLUMN_NAMES)
 
   def parquetUseColumnNames: Boolean = getConf(PARQUET_USE_COLUMN_NAMES)
+
+  def hashProbeBloomFilterPushdownMaxSize: Long = getConf(HASH_PROBE_BLOOM_FILTER_PUSHDOWN_MAX_SIZE)
+
+  def hashProbeDynamicFilterPushdownEnabled: Boolean =
+    getConf(HASH_PROBE_DYNAMIC_FILTER_PUSHDOWN_ENABLED)
+
+  def valueStreamDynamicFilterEnabled: Boolean =
+    getConf(VALUE_STREAM_DYNAMIC_FILTER_ENABLED)
 }
 
 object VeloxConfig extends ConfigRegistry {
@@ -190,6 +204,13 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .createOptional
 
+  val COLUMNAR_VELOX_BROADCAST_HASH_TABLE_BUILD_THREADS =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.broadcastHashTableBuildThreads")
+      .doc("The number of threads used to build the broadcast hash table. " +
+        "If not set or set to 0, it will use the default number of threads (available processors).")
+      .intConf
+      .createWithDefault(1)
+
   val COLUMNAR_VELOX_ASYNC_TIMEOUT =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping")
       .doc(
@@ -268,6 +289,16 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .checkValue(_ > 0, "must be a positive number")
       .createWithDefault(10000)
+
+  val MAX_TARGET_FILE_SIZE_SESSION =
+    buildConf("spark.gluten.sql.columnar.backend.velox.maxTargetFileSize")
+      .doc(
+        "The target file size for each output file when writing data. " +
+          "0 means no limit on target file size, and the actual file size will be determined by " +
+          "other factors such as max partition number and shuffle batch size.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "must be a non-negative number")
+      .createWithDefault(0)
 
   val COLUMNAR_VELOX_RESIZE_BATCHES_SHUFFLE_INPUT =
     buildConf("spark.gluten.sql.columnar.backend.velox.resizeBatches.shuffleInput")
@@ -423,29 +454,29 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .createWithDefault(100000)
 
-  val COLUMNAR_VELOX_BLOOM_FILTER_EXPECTED_NUM_ITEMS =
-    buildConf("spark.gluten.sql.columnar.backend.velox.bloomFilter.expectedNumItems")
-      .doc(
-        "The default number of expected items for the velox bloomfilter: " +
-          "'spark.bloom_filter.expected_num_items'")
-      .longConf
-      .createWithDefault(1000000L)
+  val HASH_PROBE_BLOOM_FILTER_PUSHDOWN_MAX_SIZE =
+    buildConf("spark.gluten.sql.columnar.backend.velox.hashProbe.bloomFilterPushdown.maxSize")
+      .doc("The maximum byte size of Bloom filter that can be generated from hash probe. When " +
+        "set to 0, no Bloom filter will be generated. To achieve optimal performance, this should" +
+        " not be too larger than the CPU cache size on the host.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefault(0)
 
-  val COLUMNAR_VELOX_BLOOM_FILTER_NUM_BITS =
-    buildConf("spark.gluten.sql.columnar.backend.velox.bloomFilter.numBits")
+  val HASH_PROBE_DYNAMIC_FILTER_PUSHDOWN_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.hashProbe.dynamicFilterPushdown.enabled")
       .doc(
-        "The default number of bits to use for the velox bloom filter: " +
-          "'spark.bloom_filter.num_bits'")
-      .longConf
-      .createWithDefault(8388608L)
+        "Whether hash probe can generate any dynamic filter (including Bloom filter) and push" +
+          " down to upstream operators.")
+      .booleanConf
+      .createWithDefault(true)
 
-  val COLUMNAR_VELOX_BLOOM_FILTER_MAX_NUM_BITS =
-    buildConf("spark.gluten.sql.columnar.backend.velox.bloomFilter.maxNumBits")
+  val VALUE_STREAM_DYNAMIC_FILTER_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.valueStream.dynamicFilter.enabled")
       .doc(
-        "The max number of bits to use for the velox bloom filter: " +
-          "'spark.bloom_filter.max_num_bits'")
-      .longConf
-      .createWithDefault(4194304L)
+        "Whether to apply dynamic filters pushed down from hash probe in the ValueStream" +
+          " (shuffle reader) operator to filter rows before they reach the hash join.")
+      .booleanConf
+      .createWithDefault(false)
 
   val COLUMNAR_VELOX_FILE_HANDLE_CACHE_ENABLED =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.fileHandleCacheEnabled")
@@ -520,12 +551,6 @@ object VeloxConfig extends ConfigRegistry {
       .stringConf
       .createWithDefault("legacy")
 
-  val AWS_S3_CONNECT_TIMEOUT =
-    buildConf("spark.gluten.velox.fs.s3a.connect.timeout")
-      .doc("Timeout for AWS s3 connection.")
-      .stringConf
-      .createWithDefault("200s")
-
   val VELOX_ORC_SCAN_ENABLED =
     buildConf("spark.gluten.sql.columnar.backend.velox.orc.scan.enabled")
       .doc("Enable velox orc scan. If disabled, vanilla spark orc scan will be used.")
@@ -564,6 +589,16 @@ object VeloxConfig extends ConfigRegistry {
           "Value is integer based and range is [0, 100].")
       .intConf
       .createWithDefault(0)
+
+  val VELOX_BROADCAST_BUILD_HASHTABLE_ONCE_PER_EXECUTOR =
+    buildConf("spark.gluten.velox.buildHashTableOncePerExecutor.enabled")
+      .internal()
+      .doc(
+        "When enabled, the hash table is " +
+          "constructed once per executor. If not enabled, " +
+          "the hash table is rebuilt for each task.")
+      .booleanConf
+      .createWithDefault(true)
 
   val QUERY_TRACE_ENABLED = buildConf("spark.gluten.sql.columnar.backend.velox.queryTraceEnabled")
     .doc("Enable query tracing flag.")
@@ -655,6 +690,13 @@ object VeloxConfig extends ConfigRegistry {
       .doc("Cudf input batch size after shuffle reader")
       .intConf
       .createWithDefault(Integer.MAX_VALUE)
+
+  val CUDF_SHUFFLE_MAX_PREFETCH_BYTES =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.shuffleMaxPrefetchBytes")
+      .doc("Maximum bytes to prefetch in CPU memory during GPU shuffle read while waiting" +
+        "for GPU available.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("1028MB")
 
   val MEMORY_DUMP_ON_EXIT =
     buildConf("spark.gluten.monitor.memoryDumpOnExit")

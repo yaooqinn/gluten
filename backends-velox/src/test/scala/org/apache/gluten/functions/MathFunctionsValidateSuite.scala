@@ -23,20 +23,6 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.internal.SQLConf
 
-class MathFunctionsValidateSuiteRasOff extends MathFunctionsValidateSuite {
-  override protected def sparkConf: SparkConf = {
-    super.sparkConf
-      .set(GlutenConfig.RAS_ENABLED.key, "false")
-  }
-}
-
-class MathFunctionsValidateSuiteRasOn extends MathFunctionsValidateSuite {
-  override protected def sparkConf: SparkConf = {
-    super.sparkConf
-      .set(GlutenConfig.RAS_ENABLED.key, "true")
-  }
-}
-
 class MathFunctionsValidateSuiteAnsiOn extends FunctionsValidateSuite {
 
   override protected def sparkConf: SparkConf = {
@@ -298,6 +284,13 @@ abstract class MathFunctionsValidateSuite extends FunctionsValidateSuite {
     runQueryAndCompare(
       """SELECT rand() from lineitem limit 100""".stripMargin,
       compareResult = false) {
+      checkGlutenPlan[ProjectExecTransformer]
+    }
+  }
+
+  testWithMinSparkVersion("randstr", "4.0") {
+    // randstr generates random strings, so we only verify native execution, not result equality.
+    runQueryAndCompare("SELECT randstr(5, 0) from lineitem limit 100", compareResult = false) {
       checkGlutenPlan[ProjectExecTransformer]
     }
   }

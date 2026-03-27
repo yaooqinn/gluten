@@ -28,6 +28,7 @@
 #include "velox/common/config/Config.h"
 #include "velox/common/memory/MmapAllocator.h"
 
+#include "jni/JniHashTable.h"
 #include "memory/VeloxMemoryManager.h"
 
 namespace gluten {
@@ -54,6 +55,10 @@ class VeloxBackend {
 
   VeloxMemoryManager* getGlobalMemoryManager() const {
     return globalMemoryManager_.get();
+  }
+
+  folly::Executor* executor() const {
+    return ioExecutor_.get();
   }
 
   void tearDown();
@@ -85,7 +90,7 @@ class VeloxBackend {
   std::shared_ptr<facebook::velox::cache::AsyncDataCache> asyncDataCache_;
 
   std::unique_ptr<folly::IOThreadPoolExecutor> ssdCacheExecutor_;
-  std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
+  std::unique_ptr<folly::CPUThreadPoolExecutor> ioExecutor_;
   std::shared_ptr<facebook::velox::memory::MmapAllocator> cacheAllocator_;
 
   std::string cachePathPrefix_;

@@ -17,15 +17,14 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{VeloxIcebergAppendDataExec, VeloxIcebergOverwriteByExpressionExec, VeloxIcebergOverwritePartitionsDynamicExec, VeloxIcebergReplaceDataExec}
-import org.apache.gluten.extension.columnar.enumerated.RasOffload
+import org.apache.gluten.execution._
 import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
 import org.apache.gluten.extension.columnar.offload.OffloadSingleNode
 import org.apache.gluten.extension.columnar.validator.Validators
 import org.apache.gluten.extension.injector.Injector
 
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.datasources.v2.{AppendDataExec, OverwriteByExpressionExec, OverwritePartitionsDynamicExec, ReplaceDataExec}
+import org.apache.spark.sql.execution.datasources.v2._
 
 import org.apache.iceberg.spark.source.IcebergWriteUtil.supportsWrite
 
@@ -61,6 +60,14 @@ case class OffloadIcebergOverwritePartitionsDynamic() extends OffloadSingleNode 
   }
 }
 
+case class OffloadIcebergWriteToDataSourceV2() extends OffloadSingleNode {
+  override def offload(plan: SparkPlan): SparkPlan = plan match {
+    case r: WriteToDataSourceV2Exec =>
+      VeloxIcebergWriteToDataSourceV2Exec(r).getOrElse(r)
+    case other => other
+  }
+}
+
 object OffloadIcebergWrite {
   def inject(injector: Injector): Unit = {
     // Inject legacy rule.
@@ -70,22 +77,13 @@ object OffloadIcebergWrite {
           OffloadIcebergAppend(),
           OffloadIcebergReplaceData(),
           OffloadIcebergOverwrite(),
-          OffloadIcebergOverwritePartitionsDynamic())
+          OffloadIcebergOverwritePartitionsDynamic(),
+          OffloadIcebergWriteToDataSourceV2()
+        )
         HeuristicTransform.Simple(
           Validators.newValidator(new GlutenConfig(c.sqlConf), offload),
           offload
         )
     }
-
-    val offloads: Seq[RasOffload] = Seq(
-      RasOffload.from[AppendDataExec](OffloadIcebergAppend()),
-      RasOffload.from[ReplaceDataExec](OffloadIcebergReplaceData()),
-      RasOffload.from[OverwriteByExpressionExec](OffloadIcebergOverwrite()),
-      RasOffload.from[OverwritePartitionsDynamicExec](OffloadIcebergOverwritePartitionsDynamic())
-    )
-    offloads.foreach(
-      offload =>
-        injector.gluten.ras.injectRasRule(
-          c => RasOffload.Rule(offload, Validators.newValidator(new GlutenConfig(c.sqlConf)), Nil)))
   }
 }

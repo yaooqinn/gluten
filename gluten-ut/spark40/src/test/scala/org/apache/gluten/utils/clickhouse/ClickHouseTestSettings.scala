@@ -1022,7 +1022,7 @@ class ClickHouseTestSettings extends BackendTestSettings {
     .excludeCH(
       "SPARK-45882: BroadcastHashJoinExec propagate partitioning should respect CoalescedHashPartitioning")
   enableSuite[GlutenJsonExpressionsSuite]
-    // https://github.com/apache/incubator-gluten/issues/8102
+    // https://github.com/apache/gluten/issues/8102
     .includeCH("$.store.book")
     .includeCH("$")
     .includeCH("$.store.book[0]")
@@ -1982,6 +1982,7 @@ class ClickHouseTestSettings extends BackendTestSettings {
     .excludeCH("SPLIT")
   enableSuite[GlutenRemoveRedundantWindowGroupLimitsSuite]
     .excludeCH("remove redundant WindowGroupLimits")
+    .excludeCH("Gluten - remove redundant WindowGroupLimits")
   enableSuite[GlutenReplaceHashWithSortAggSuite]
     .exclude("replace partial hash aggregate with sort aggregate")
     .exclude("replace partial and final hash aggregate together with sort aggregate")
@@ -2036,6 +2037,8 @@ class ClickHouseTestSettings extends BackendTestSettings {
     .excludeCH(
       "window function: multiple window expressions specified by range in a single expression")
     .excludeCH("Gluten - Filter on row number")
+    .excludeCH("Gluten - Filter on rank")
+    .excludeCH("Gluten - Filter on dense_rank")
   enableSuite[GlutenSameResultSuite]
   enableSuite[GlutenSaveLoadSuite]
   enableSuite[GlutenScalaReflectionRelationSuite]

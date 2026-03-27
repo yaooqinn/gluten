@@ -16,17 +16,18 @@
  */
 package org.apache.gluten.integration.ds
 
-import org.apache.gluten.integration.{DataGen, QuerySet, Suite, TableCreator}
+import org.apache.gluten.integration.{DataGen, QuerySet, Suite}
 import org.apache.gluten.integration.action.Action
 import org.apache.gluten.integration.metrics.MetricMapper
+import org.apache.gluten.integration.table.{TableAnalyzer, TableCreator}
 
 import org.apache.spark.SparkConf
 
+import org.apache.hadoop.fs.Path
 import org.apache.log4j.Level
 
-import java.io.File
-
 class TpcdsSuite(
+    val appName: String,
     val masterUrl: String,
     val actions: Array[Action],
     val testConf: SparkConf,
@@ -45,12 +46,15 @@ class TpcdsSuite(
     val disableAqe: Boolean,
     val disableBhj: Boolean,
     val disableWscg: Boolean,
+    val enableCbo: Boolean,
     val shufflePartitions: Int,
     val scanPartitions: Int,
     val decimalAsDouble: Boolean,
     val baselineMetricMapper: MetricMapper,
-    val testMetricMapper: MetricMapper)
+    val testMetricMapper: MetricMapper,
+    val reportPath: String)
   extends Suite(
+    appName,
     masterUrl,
     actions,
     testConf,
@@ -64,13 +68,21 @@ class TpcdsSuite(
     disableAqe,
     disableBhj,
     disableWscg,
+    enableCbo,
     shufflePartitions,
     scanPartitions,
     decimalAsDouble,
     baselineMetricMapper,
-    testMetricMapper
+    testMetricMapper,
+    reportPath
   ) {
   import TpcdsSuite._
+
+  require(
+    Set("parquet", "delta").contains(dataSource),
+    s"Data source type $dataSource is not supported by TPC-DS suite")
+
+  private val tableLayout = new TpcdsTableLayout(genPartitionedData)
 
   override protected def historyWritePath(): String = HISTORY_WRITE_PATH
 
@@ -80,25 +92,20 @@ class TpcdsSuite(
     } else {
       "non_partitioned"
     }
-    val featureFlags = dataGenFeatures.map(feature => s"-$feature").mkString("")
-    if (dataDir.startsWith("hdfs://")) {
-      return s"$dataDir/$TPCDS_WRITE_RELATIVE_PATH-$dataScale-$dataSource-$partitionedFlag$featureFlags"
-    }
-    new File(dataDir).toPath
-      .resolve(s"$TPCDS_WRITE_RELATIVE_PATH-$dataScale-$dataSource-$partitionedFlag$featureFlags")
-      .toFile
-      .getAbsolutePath
+    val typeModifierFlags = typeModifiers().map(m => s"-${m.name()}").sorted.mkString("-")
+    val featureFlags = dataGenFeatures.map(feature => s"-$feature").sorted.mkString("")
+    val relative =
+      s"$TPCDS_WRITE_RELATIVE_PATH-$dataScale-$dataSource-$partitionedFlag$typeModifierFlags$featureFlags"
+    new Path(dataDir, relative).toString
   }
 
   override private[integration] def createDataGen(): DataGen = {
-    checkDataGenArgs(dataSource, dataScale, genPartitionedData)
     new TpcdsDataGen(
-      sessionSwitcher.spark(),
+      dataSource,
+      tableLayout,
       dataScale,
       shufflePartitions,
-      dataSource,
       dataWritePath(),
-      genPartitionedData,
       dataGenFeatures,
       typeModifiers())
   }
@@ -109,7 +116,10 @@ class TpcdsSuite(
 
   override private[integration] def desc(): String = "TPC-DS"
 
-  override def tableCreator(): TableCreator = TableCreator.discoverSchema()
+  override def tableCreator(): TableCreator =
+    TableCreator.createFromLayout(tableLayout, typeModifiers())
+
+  override def tableAnalyzer0(): TableAnalyzer = TableAnalyzer.analyzeAll()
 }
 
 object TpcdsSuite {
@@ -220,13 +230,4 @@ object TpcdsSuite {
     "q99"
   )
   private val HISTORY_WRITE_PATH = "/tmp/tpcds-history"
-
-  private def checkDataGenArgs(
-      dataSource: String,
-      scale: Double,
-      genPartitionedData: Boolean): Unit = {
-    require(
-      Set("parquet", "delta").contains(dataSource),
-      s"Data source type $dataSource is not supported by TPC-DS suite")
-  }
 }

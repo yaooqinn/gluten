@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -258,8 +258,8 @@ function build_gluten_cpp {
     GLUTEN_CMAKE_OPTIONS+=" -DCMAKE_PREFIX_PATH=$INSTALL_PREFIX"
   fi
 
-  cmake $GLUTEN_CMAKE_OPTIONS ..
-  make -j $NUM_THREADS
+  cmake -G Ninja $GLUTEN_CMAKE_OPTIONS ..
+  ninja -j $NUM_THREADS
 }
 
 function build_velox_backend {

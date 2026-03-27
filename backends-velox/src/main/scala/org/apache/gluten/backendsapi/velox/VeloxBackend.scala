@@ -97,6 +97,11 @@ object VeloxBackendSettings extends BackendSettingsApi {
   val GLUTEN_VELOX_INTERNAL_UDF_LIB_PATHS = VeloxBackend.CONF_PREFIX + ".internal.udfLibraryPaths"
   val GLUTEN_VELOX_UDF_ALLOW_TYPE_CONVERSION = VeloxBackend.CONF_PREFIX + ".udfAllowTypeConversion"
 
+  val GLUTEN_VELOX_BROADCAST_CACHE_EXPIRED_TIME: String =
+    VeloxBackend.CONF_PREFIX + ("broadcast.cache.expired.time")
+  // unit: SECONDS, default 1 day
+  val GLUTEN_VELOX_BROADCAST_CACHE_EXPIRED_TIME_DEFAULT: Int = 86400
+
   override def primaryBatchType: Convention.BatchType = VeloxBatchType
 
   override def validateScanExec(
@@ -149,7 +154,7 @@ object VeloxBackendSettings extends BackendSettingsApi {
         case ParquetReadFormat =>
           val parquetOptions = new ParquetOptions(CaseInsensitiveMap(properties), SQLConf.get)
           if (parquetOptions.mergeSchema) {
-            // https://github.com/apache/incubator-gluten/issues/7174
+            // https://github.com/apache/gluten/issues/7174
             Some(s"not support when merge schema is true")
           } else {
             None
@@ -204,10 +209,9 @@ object VeloxBackendSettings extends BackendSettingsApi {
       }
       val fileLimit = GlutenConfig.get.parquetMetadataFallbackFileLimit
       val parquetOptions = new ParquetOptions(CaseInsensitiveMap(properties), SQLConf.get)
-      val parquetMetadataValidationResult =
-        ParquetMetadataUtils.validateMetadata(rootPaths, hadoopConf, parquetOptions, fileLimit)
-      parquetMetadataValidationResult.map(
-        reason => s"Detected unsupported metadata in parquet files: $reason")
+      ParquetMetadataUtils
+        .validateMetadata(rootPaths, hadoopConf, parquetOptions, fileLimit)
+        .map(reason => s"Detected unsupported metadata in parquet files: $reason")
     }
 
     def validateDataSchema(): Option[String] = {
@@ -419,7 +423,7 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
   override def supportWindowGroupLimitExec(rankLikeFunction: Expression): Boolean = {
     rankLikeFunction match {
-      case _: RowNumber => true
+      case _: RowNumber | _: Rank | _: DenseRank => true
       case _ => false
     }
   }
@@ -495,13 +499,17 @@ object VeloxBackendSettings extends BackendSettingsApi {
     allSupported
   }
 
+  override def enableJoinKeysRewrite(): Boolean = false
+
   override def supportColumnarShuffleExec(): Boolean = {
     val conf = GlutenConfig.get
     conf.enableColumnarShuffle &&
     (conf.isUseGlutenShuffleManager || conf.shuffleManagerSupportsColumnarShuffle)
   }
 
-  override def enableJoinKeysRewrite(): Boolean = false
+  override def enableHashTableBuildOncePerExecutor(): Boolean = {
+    VeloxConfig.get.enableBroadcastBuildOncePerExecutor
+  }
 
   override def supportHashBuildJoinTypeOnLeft: JoinType => Boolean = {
     t =>
@@ -589,6 +597,8 @@ object VeloxBackendSettings extends BackendSettingsApi {
   override def supportOverwriteByExpression(): Boolean = enableEnhancedFeatures()
 
   override def supportOverwritePartitionsDynamic(): Boolean = enableEnhancedFeatures()
+
+  override def supportWriteToDataSourceV2(): Boolean = enableEnhancedFeatures()
 
   /** Velox does not support columnar shuffle with empty schema. */
   override def supportEmptySchemaColumnarShuffle(): Boolean = false

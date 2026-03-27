@@ -128,7 +128,7 @@ compiling Gluten.
 Note: If you have previously compiled Velox in release mode, use the command below to compile in debug mode.
 
 ```bash
-cd incubator-gluten/ep/build-velox/build/velox_ep
+cd gluten/ep/build-velox/build/velox_ep
 
 # Build the Velox debug version in <velox_home>/_build/debug
 make debug EXTRA_CMAKE_FLAGS="-DVELOX_ENABLE_PARQUET=ON -DENABLE_HDFS=ON -DVELOX_BUILD_TESTING=OFF  -DVELOX_ENABLE_DUCKDB=ON -DVELOX_BUILD_TEST_UTILS=ON"
@@ -242,6 +242,42 @@ To check Surefire reports:
 3. There, you can check the results with summary and annotations.
 
 ![](../image/surefire-report.png)  
+
+### Mac development
+
+#### Compile
+Gluten does not provide a prebuilt JAR for macOS. However, you can compile it yourself and run or debug it locally using an IDE.
+
+First, set the installation prefix for dependencies:
+```bash
+export INSTALL_PREFIX=$HOME/velox/deps-install
+```
+
+All Velox-related libraries will be installed under the directory specified by `INSTALL_PREFIX`.
+
+Use the following commands to build Gluten. Note that on macOS you must disable tests (--build_tests=OFF), as some tests do not run successfully.
+
+```bash
+# Build velox and gluten-cpp
+./dev/builddeps-veloxbe.sh --run_setup_script=ON --build_arrow=ON --build_tests=OFF
+# Build java code
+mvn clean install -Pbackends-velox -Pspark-3.4 -DskipTests
+```
+
+Note: follow the steps in [build-gluten-with-velox-backend](../get-started/Velox.md#build-gluten-with-velox-backend).
+
+After the build completes, you can use your IDE to run and debug Gluten locally.
+
+#### Intellij debug
+
+Intellij requires two extra config to execute the unit test.
+1. Set the JDK to Azul zulu - aarch64
+
+![](../image/IDEA-jdk.png)
+
+2. Set scala compiler `Incrementality type` to `IDEA`
+
+![](../image/IDEA-scala-compiler.png)
 
 ## Debug C++ Code with Core Dump
 
@@ -360,7 +396,7 @@ valgrind --leak-check=yes ./exec_backend_test
 ## Run TPC-H and TPC-DS
 
 We supply `<gluten_home>/tools/gluten-it` to execute these queries.
-See [velox_backend_x86.yml](https://github.com/apache/incubator-gluten/blob/main/.github/workflows/velox_backend_x86.yml).
+See [velox_backend_x86.yml](https://github.com/apache/gluten/blob/main/.github/workflows/velox_backend_x86.yml).
 
 ## Enable Gluten for Spark
 
@@ -371,7 +407,7 @@ spark-shell --name run_gluten \
  --conf spark.plugins=org.apache.gluten.GlutenPlugin \
  --conf spark.memory.offHeap.enabled=true \
  --conf spark.memory.offHeap.size=20g \
- --jars https://dlcdn.apache.org/incubator/gluten/1.4.0-incubating/apache-gluten-1.4.0-incubating-bin-spark35.tar.gz \
+ --jars https://dlcdn.apache.org/gluten/1.6.0/apache-gluten-1.6.0-bin-spark-3.5.tar.gz \
  --conf spark.shuffle.manager=org.apache.spark.shuffle.sort.ColumnarShuffleManager
 ```
 

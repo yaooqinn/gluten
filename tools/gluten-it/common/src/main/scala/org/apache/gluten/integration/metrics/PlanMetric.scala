@@ -31,19 +31,14 @@ import scala.reflect.ClassTag
 
 case class PlanMetric(
     queryPath: String,
-    plan: SparkPlan,
+    planId: Int,
+    planNodeName: String,
     key: String,
     metric: SQLMetric,
-    tags: Map[String, Seq[MetricTag[_]]]) {
+    tags: Set[MetricTag]) {
 
-  def containsTags[T <: MetricTag[_]: ClassTag]: Boolean = {
-    val name = MetricTag.nameOf[T]
-    tags.contains(name)
-  }
-  def getTags[T <: MetricTag[_]: ClassTag]: Seq[T] = {
-    require(containsTags[T])
-    val name = MetricTag.nameOf[T]
-    tags(name).asInstanceOf[Seq[T]]
+  def containsTags(tag: MetricTag): Boolean = {
+    tags.contains(tag)
   }
 }
 
@@ -55,6 +50,8 @@ object PlanMetric {
           new NodeTimeReporter(10),
           new StepTimeReporter(30)
         ))
+    case "join-selectivity" =>
+      new ChainedReporter(Seq(new JoinSelectivityReporter(30)))
     case other => throw new IllegalArgumentException(s"Metric reporter type $other not defined")
   }
 
@@ -83,7 +80,7 @@ object PlanMetric {
     override def toString(metrics: Seq[PlanMetric]): String = {
       val sb = new StringBuilder()
       val selfTimes = metrics
-        .filter(_.containsTags[MetricTag.IsSelfTime])
+        .filter(_.containsTags(MetricTag.IsSelfTime))
       val sorted = selfTimes.sortBy(m => toNanoTime(m.metric))(Ordering.Long.reverse)
       sb.append(s"Top $topN computation steps that took longest time to execute: ")
       sb.append(System.lineSeparator())
@@ -96,12 +93,12 @@ object PlanMetric {
           Leaf("Step Time (ns)"))
       for (i <- 0 until (topN.min(sorted.size))) {
         val m = sorted(i)
-        val f = new File(m.queryPath).toPath.getFileName.toString
+        val queryPath = new File(m.queryPath).toPath.getFileName.toString
         tr.appendRow(
           Seq(
-            f,
-            m.plan.id.toString,
-            m.plan.nodeName,
+            queryPath,
+            m.planId.toString,
+            m.planNodeName,
             s"[${m.metric.name.getOrElse("")}] ${toNanoTime(m.metric).toString}"))
       }
       val out = new ByteArrayOutputStream()
@@ -121,18 +118,19 @@ object PlanMetric {
     override def toString(metrics: Seq[PlanMetric]): String = {
       val sb = new StringBuilder()
       val selfTimes = metrics
-        .filter(_.containsTags[MetricTag.IsSelfTime])
+        .filter(_.containsTags(MetricTag.IsSelfTime))
       val rows: Seq[TableRow] = selfTimes
-        .groupBy(m => m.plan.id)
+        .groupBy(m => m.planId)
         .toSeq
         .map {
           perPlanId =>
-            assert(perPlanId._2.map(_.plan.id).distinct.count(_ => true) == 1)
+            assert(perPlanId._2.map(_.planId).distinct.count(_ => true) == 1)
             assert(perPlanId._2.map(_.queryPath).distinct.count(_ => true) == 1)
             val head = perPlanId._2.head
             TableRow(
               head.queryPath,
-              head.plan,
+              head.planId,
+              head.planNodeName,
               perPlanId._2.map(m => toNanoTime(m.metric)).sum,
               perPlanId._2.map(m => (m.key, m.metric)))
         }
@@ -149,7 +147,7 @@ object PlanMetric {
       for (i <- 0 until (topN.min(sorted.size))) {
         val row = sorted(i)
         val f = new File(row.queryPath).toPath.getFileName.toString
-        tr.appendRow(Seq(f, row.plan.id.toString, row.plan.nodeName, s"${row.selfTimeNs}"))
+        tr.appendRow(Seq(f, row.planId.toString, row.planNodeName, s"${row.selfTimeNs}"))
       }
       val out = new ByteArrayOutputStream()
       tr.print(out)
@@ -161,8 +159,86 @@ object PlanMetric {
   private object NodeTimeReporter {
     private case class TableRow(
         queryPath: String,
-        plan: SparkPlan,
+        planId: Int,
+        planNodeName: String,
         selfTimeNs: Long,
         metrics: Seq[(String, SQLMetric)])
+  }
+
+  private class JoinSelectivityReporter(topN: Int) extends Reporter {
+    import JoinSelectivityReporter._
+    private def toNumRows(m: SQLMetric): Long = m.metricType match {
+      case "sum" => m.value
+    }
+
+    override def toString(metrics: Seq[PlanMetric]): String = {
+      val sb = new StringBuilder()
+      sb.append(s"Top $topN join operations that has lowest selectivity: ")
+      sb.append(System.lineSeparator())
+      sb.append(System.lineSeparator())
+
+      val tr: TableRender[Seq[String]] =
+        TableRender.create(
+          Leaf("Query"),
+          Leaf("Node ID"),
+          Leaf("Node Name"),
+          Leaf("Input Row Count"),
+          Leaf("Output Row Count"),
+          Leaf("Selectivity"))
+      val probeInputNumRows = metrics
+        .filter(_.containsTags(MetricTag.IsJoinProbeInputNumRows))
+        .groupBy(m => m.planId)
+        .toSeq
+        .sortBy(_._1)
+      val probeOutputNumRows = metrics
+        .filter(_.containsTags(MetricTag.IsJoinProbeOutputNumRows))
+        .groupBy(m => m.planId)
+        .toSeq
+        .sortBy(_._1)
+      assert(probeInputNumRows.size == probeOutputNumRows.size)
+      val rows = probeInputNumRows
+        .zip(probeOutputNumRows)
+        .map {
+          case ((id1, inputMetrics), (id2, outputMetrics)) =>
+            assert(id1 == id2)
+            val queryPath = new File(inputMetrics.head.queryPath).toPath.getFileName.toString
+            val inputNumRows = inputMetrics.map(m => toNumRows(m.metric)).sum
+            val outputNumRows = outputMetrics.map(m => toNumRows(m.metric)).sum
+            val selectivity = outputNumRows.toDouble / inputNumRows.toDouble
+            TableRow(
+              queryPath,
+              id1,
+              inputMetrics.head.planNodeName,
+              inputNumRows,
+              outputNumRows,
+              selectivity)
+        }
+        .sortBy(_.selectivity)
+      for (i <- 0 until (topN.min(rows.size))) {
+        val row = rows(i)
+        tr.appendRow(
+          Seq(
+            row.queryPath,
+            row.planId.toString,
+            row.planNodeName,
+            row.probeInputNumRows.toString,
+            row.probeOutputNumRows.toString,
+            "%.3f".format(row.selectivity)))
+      }
+      val out = new ByteArrayOutputStream()
+      tr.print(out)
+      sb.append(out.toString(Charset.defaultCharset))
+      sb.toString()
+    }
+  }
+
+  private object JoinSelectivityReporter {
+    private case class TableRow(
+        queryPath: String,
+        planId: Long,
+        planNodeName: String,
+        probeInputNumRows: Long,
+        probeOutputNumRows: Long,
+        selectivity: Double)
   }
 }

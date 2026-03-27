@@ -200,5 +200,3 @@ private[gluten] class GlutenExecutorPlugin extends ExecutorPlugin {
     taskListeners.reverse.foreach(_.onTaskFailed(failureReason))
   }
 }
-
-private object GlutenPlugin {}

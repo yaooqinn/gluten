@@ -16,14 +16,17 @@
  */
 package org.apache.gluten.integration.action
 
-import org.apache.gluten.integration.{Query, QueryRunner, Suite, TableCreator}
+import org.apache.gluten.integration.{Query, QueryRunner, Suite}
 import org.apache.gluten.integration.QueryRunner.QueryResult
 import org.apache.gluten.integration.action.Actions.QuerySelector
 import org.apache.gluten.integration.action.TableRender.RowParser.FieldAppender.RowAppender
 import org.apache.gluten.integration.metrics.{MetricMapper, PlanMetric}
 import org.apache.gluten.integration.stat.RamStat
+import org.apache.gluten.integration.table.TableCreator
 
 import org.apache.spark.sql.SparkSession
+
+import java.io.PrintStream
 
 case class Queries(
     queries: QuerySelector,
@@ -42,7 +45,7 @@ case class Queries(
       new QueryRunner(suite.dataSource(), suite.dataWritePath())
     val sessionSwitcher = suite.sessionSwitcher
     sessionSwitcher.useSession("test", "Run Queries")
-    runner.createTables(suite.tableCreator(), sessionSwitcher.spark())
+    runner.createTables(suite.tableCreator(), suite.tableAnalyzer(), sessionSwitcher.spark())
     val results = (0 until iterations).flatMap {
       iteration =>
         println(s"Running tests (iteration $iteration)...")
@@ -61,7 +64,10 @@ case class Queries(
             } finally {
               if (noSessionReuse) {
                 sessionSwitcher.renewSession()
-                runner.createTables(suite.tableCreator(), sessionSwitcher.spark())
+                runner.createTables(
+                  suite.tableCreator(),
+                  suite.tableAnalyzer(),
+                  sessionSwitcher.spark())
               }
             }
         }
@@ -73,19 +79,6 @@ case class Queries(
     val failedQueries = results.filter(!_.queryResult.succeeded())
 
     println()
-
-    if (failedQueries.nonEmpty) {
-      println(s"There are failed queries.")
-      if (!suppressFailureMessages) {
-        println()
-        failedQueries.foreach {
-          failedQuery =>
-            println(
-              s"Query ${failedQuery.queryResult.caseId()} failed by error: ${failedQuery.queryResult.asFailure().error}")
-        }
-      }
-    }
-
     // RAM stats
     println("Performing GC to collect RAM statistics... ")
     System.gc()
@@ -96,33 +89,47 @@ case class Queries(
       RamStat.getJvmHeapTotal(),
       RamStat.getProcessRamUsed()
     )
-    println("")
+    println()
+
+    // Write out test report.
+    val reportAppender = suite.getReporter().actionAppender(getClass.getSimpleName)
+    if (failedQueries.nonEmpty) {
+      reportAppender.err.println(s"There are failed queries.")
+      if (!suppressFailureMessages) {
+        reportAppender.err.println()
+        failedQueries.foreach {
+          failedQuery =>
+            println(
+              s"Query ${failedQuery.queryResult.caseId()} failed by error: ${failedQuery.queryResult.asFailure().error}")
+        }
+      }
+    }
 
     val sqlMetrics = succeededQueries.flatMap(_.queryResult.asSuccess().runResult.sqlMetrics)
     metricsReporters.foreach {
       r =>
         val report = r.toString(sqlMetrics)
-        println(report)
-        println("")
+        reportAppender.out.println(report)
+        reportAppender.out.println()
     }
 
-    println("Test report: ")
-    println("")
-    printf("Summary: %d out of %d queries passed. \n", passedCount, count)
-    println("")
+    reportAppender.out.println("Test report: ")
+    reportAppender.out.println()
+    reportAppender.out.println("Summary: %d out of %d queries passed.".format(passedCount, count))
+    reportAppender.out.println()
     val all =
       succeededQueries.map(_.queryResult).asSuccesses().agg("all").map(s => TestResultLine(s))
-    Queries.printResults(succeededQueries ++ all)
-    println("")
+    Queries.printResults(reportAppender.out, succeededQueries ++ all)
+    reportAppender.out.println()
 
     if (failedQueries.isEmpty) {
-      println("No failed queries. ")
-      println("")
+      reportAppender.out.println("No failed queries. ")
+      reportAppender.out.println()
     } else {
-      println("Failed queries: ")
-      println("")
-      Queries.printResults(failedQueries)
-      println("")
+      reportAppender.err.println("Failed queries: ")
+      reportAppender.err.println()
+      Queries.printResults(reportAppender.err, failedQueries)
+      reportAppender.err.println()
     }
 
     if (passedCount != count) {
@@ -144,10 +151,8 @@ object Queries {
         line.queryResult match {
           case QueryRunner.Success(_, runResult) =>
             inc.next().write(runResult.rows.size)
-            inc.next().write(runResult.planningTimeMillis)
             inc.next().write(runResult.executionTimeMillis)
           case QueryRunner.Failure(_, error) =>
-            inc.next().write(None)
             inc.next().write(None)
             inc.next().write(None)
         }
@@ -155,17 +160,13 @@ object Queries {
     }
   }
 
-  private def printResults(results: Seq[TestResultLine]): Unit = {
-    val render = TableRender.plain[TestResultLine](
-      "Query ID",
-      "Was Passed",
-      "Row Count",
-      "Plan Time (Millis)",
-      "Query Time (Millis)")
+  private def printResults(out: PrintStream, results: Seq[TestResultLine]): Unit = {
+    val render = TableRender
+      .plain[TestResultLine]("Query ID", "Was Passed", "Row Count", "Query Time (Millis)")
 
     results.foreach(line => render.appendRow(line))
 
-    render.print(System.out)
+    render.print(out)
   }
 
   private def runQuery(

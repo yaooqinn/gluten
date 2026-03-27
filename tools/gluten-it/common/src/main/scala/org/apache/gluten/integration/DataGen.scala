@@ -22,15 +22,17 @@ import org.apache.spark.sql.types.{DataType, StructField, StructType}
 import scala.collection.mutable
 
 trait DataGen {
-  def gen(): Unit
+  def gen(spark: SparkSession): Unit
 }
 
 abstract class TypeModifier(val predicate: DataType => Boolean, val to: DataType)
   extends Serializable {
+  def name(): String
   def modValue(value: Any): Any
 }
 
 class NoopModifier(t: DataType) extends TypeModifier(_ => true, t) {
+  override def name(): String = "noop"
   override def modValue(value: Any): Any = value
 }
 
@@ -71,7 +73,7 @@ object DataGen {
 
   trait Feature extends Serializable {
     def name(): String
-    def run(spark: SparkSession, source: String)
+    def run(spark: SparkSession, source: String): Unit
   }
 
   object Feature {

@@ -29,8 +29,8 @@ class GlutenDirectBufferedInput : public facebook::velox::dwio::common::DirectBu
       facebook::velox::StringIdLease fileNum,
       std::shared_ptr<facebook::velox::cache::ScanTracker> tracker,
       facebook::velox::StringIdLease groupId,
-      std::shared_ptr<facebook::velox::io::IoStatistics> ioStats,
-      std::shared_ptr<facebook::velox::filesystems::File::IoStats> fsStats,
+      std::shared_ptr<facebook::velox::io::IoStatistics> ioStatistics,
+      std::shared_ptr<facebook::velox::IoStats> ioStats,
       folly::Executor* executor,
       const facebook::velox::io::ReaderOptions& readerOptions,
       folly::F14FastMap<std::string, std::string> fileReadOps = {})
@@ -40,14 +40,22 @@ class GlutenDirectBufferedInput : public facebook::velox::dwio::common::DirectBu
             std::move(fileNum),
             std::move(tracker),
             std::move(groupId),
+            std::move(ioStatistics),
             std::move(ioStats),
-            std::move(fsStats),
             executor,
             readerOptions,
             std::move(fileReadOps)) {}
 
   ~GlutenDirectBufferedInput() override {
     requests_.clear();
+    // Cancel all the planned loads as soon as possible to avoid unnecessary IO.
+    for (auto& load : coalescedLoads_) {
+      if (load->state() == facebook::velox::cache::CoalescedLoad::State::kPlanned) {
+        load->cancel();
+      }
+    }
+    // Ensure all the loadings can finish in the TableScan destructor to avoid the issue that the load is still running
+    // when the VeloxMemoryManager used by the whole task is trying to destruct.
     for (auto& load : coalescedLoads_) {
       if (load->state() == facebook::velox::cache::CoalescedLoad::State::kLoading) {
         folly::SemiFuture<bool> waitFuture(false);
@@ -56,7 +64,6 @@ class GlutenDirectBufferedInput : public facebook::velox::dwio::common::DirectBu
           std::move(waitFuture).via(&exec).wait();
         }
       }
-      load->cancel();
     }
     coalescedLoads_.clear();
   }

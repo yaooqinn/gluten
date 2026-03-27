@@ -55,7 +55,7 @@ trait ColumnarShuffledJoin extends BaseJoinExec {
       // partitioning doesn't satisfy `HashClusteredDistribution`.
       UnspecifiedDistribution :: UnspecifiedDistribution :: Nil
     } else {
-      SparkShimLoader.getSparkShims.getDistribution(leftKeys, rightKeys)
+      ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
     }
   }
 
@@ -63,6 +63,9 @@ trait ColumnarShuffledJoin extends BaseJoinExec {
     case _: InnerLike =>
       PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
     case LeftOuter => left.outputPartitioning
+    // LeftSingle (Spark 4.0+) has same partitioning as LeftOuter
+    case leftSingle if SparkShimLoader.getSparkShims.isLeftSingleJoinType(leftSingle) =>
+      left.outputPartitioning
     case RightOuter => right.outputPartitioning
     case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
     case LeftExistence(_) => left.outputPartitioning
@@ -115,7 +118,6 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
         fromFields.length == toFields.length &&
         fromFields.zip(toFields).forall {
           case (l, r) =>
-            l.name.equalsIgnoreCase(r.name) &&
             sameType(l.dataType, r.dataType)
         }
 
@@ -157,6 +159,9 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
         case _: InnerLike => expandPartitioning(right.outputPartitioning)
         case RightOuter => right.outputPartitioning
         case LeftOuter => left.outputPartitioning
+        // LeftSingle (Spark 4.0+) - same as LeftOuter
+        case leftSingle if SparkShimLoader.getSparkShims.isLeftSingleJoinType(leftSingle) =>
+          left.outputPartitioning
         case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
         case x =>
           throw new IllegalArgumentException(
@@ -166,6 +171,9 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
       joinType match {
         case _: InnerLike => expandPartitioning(left.outputPartitioning)
         case LeftOuter | LeftSemi | LeftAnti | _: ExistenceJoin => left.outputPartitioning
+        // LeftSingle (Spark 4.0+) - same as LeftOuter
+        case leftSingle if SparkShimLoader.getSparkShims.isLeftSingleJoinType(leftSingle) =>
+          left.outputPartitioning
         case RightOuter => right.outputPartitioning
         case FullOuter => UnknownPartitioning(right.outputPartitioning.numPartitions)
         case x =>
@@ -177,9 +185,14 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
   // https://issues.apache.org/jira/browse/SPARK-31869
   private def expandPartitioning(partitioning: Partitioning): Partitioning = {
     val expandLimit = conf.broadcastHashJoinOutputPartitioningExpandLimit
+    val (buildKeys, streamedKeys) = if (needSwitchChildren) {
+      (leftKeys, rightKeys)
+    } else {
+      (rightKeys, leftKeys)
+    }
     joinType match {
       case _: InnerLike if expandLimit > 0 =>
-        new ExpandOutputPartitioningShim(streamedKeyExprs, buildKeyExprs, expandLimit)
+        new ExpandOutputPartitioningShim(streamedKeys, buildKeys, expandLimit)
           .expandPartitioning(partitioning)
       case _ => partitioning
     }
@@ -253,7 +266,8 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
       inputStreamedOutput,
       inputBuildOutput,
       context,
-      operatorId
+      operatorId,
+      buildPlan.id.toString
     )
 
     context.registerJoinParam(operatorId, joinParams)
@@ -357,7 +371,15 @@ abstract class BroadcastHashJoinExecTransformerBase(
     JoinUtils.getDirectJoinOutputSeq(joinType, left.output, right.output, getClass.getSimpleName)
 
   override def requiredChildDistribution: Seq[Distribution] = {
-    val mode = HashedRelationBroadcastMode(buildKeyExprs, isNullAwareAntiJoin)
+    // Use the same bound+rewritten keys as Spark's BroadcastHashJoinExec to ensure
+    // the mode matches the BroadcastExchange created by EnsureRequirements.
+    val (bKeys, bOutput) = buildSide match {
+      case BuildLeft => (leftKeys, left.output)
+      case BuildRight => (rightKeys, right.output)
+    }
+    val boundBuildKeys =
+      BindReferences.bindReferences(HashJoin.rewriteKeyExpr(bKeys), bOutput)
+    val mode = HashedRelationBroadcastMode(boundBuildKeys, isNullAwareAntiJoin)
     buildSide match {
       case BuildLeft =>
         BroadcastDistribution(mode) :: UnspecifiedDistribution :: Nil

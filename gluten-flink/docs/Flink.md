@@ -48,7 +48,7 @@ As some features have not been committed to upstream, you have to use the follow
 ## fetch velox4j code
 git clone -b gluten-0530 https://github.com/bigo-sg/velox4j.git
 cd velox4j
-git reset --hard 288d181a1b05c47f1f17339eb498dd6375f7aec8
+git reset --hard 889bafcf2fa04e8c31a30edbdf40fe203ef58484
 mvn clean install -DskipTests -Dgpg.skip -Dspotless.skip=true
 ```
 **Get gluten**
@@ -57,7 +57,7 @@ mvn clean install -DskipTests -Dgpg.skip -Dspotless.skip=true
 ## config maven, like proxy in ~/.m2/settings.xml
 
 ## fetch gluten code
-git clone https://github.com/apache/incubator-gluten.git
+git clone https://github.com/apache/gluten.git
 ```
 
 # Build Gluten Flink with Velox Backend
@@ -98,8 +98,8 @@ export FLINK_HOME=
 cd $FLINK_HOME
 mkdir -p gluten_lib
 ln -s $VELOX4J_HOME/target/velox4j-0.1.0-SNAPSHOT.jar $FLINK_HOME/gluten_lib/velox4j-0.1.0-SNAPSHOT.jar
-ln -s $GLUTEN_FLINK_HOME/runtime/target/gluten-flink-runtime-1.6.0-SNAPSHOT.jar $FLINK_HOME/gluten_lib/gluten-flink-runtime-1.6.0.jar
-ln -s $GLUTEN_FLINK_HOME/loader/target/gluten-flink-loader-1.6.0-SNAPSHOT.jar $FLINK_HOME/gluten_lib/gluten-flink-loader-1.6.0.jar
+ln -s $GLUTEN_FLINK_HOME/runtime/target/gluten-flink-runtime-1.7.0-SNAPSHOT.jar $FLINK_HOME/gluten_lib/gluten-flink-runtime-1.6.0.jar
+ln -s $GLUTEN_FLINK_HOME/loader/target/gluten-flink-loader-1.7.0-SNAPSHOT.jar $FLINK_HOME/gluten_lib/gluten-flink-loader-1.6.0.jar
 ```
 
 And make them loaded before flink libraries.
@@ -126,7 +126,7 @@ bin/flink run examples/table/StreamSQLExample.jar
 Then you can get the result in `log/flink-*-taskexecutor-*.out`.
 And you can see an operator named `gluten-cal` from the web frontend of your flink job.
 
-**Notice: current this example will cause npe until  [issue-10315](https://github.com/apache/incubator-gluten/issues/10315) get resolved.**
+**Notice: current this example will cause npe until  [issue-10315](https://github.com/apache/gluten/issues/10315) get resolved.**
 
 #### All operators executed by native
 Another example supports all operators executed by native. 
@@ -139,6 +139,30 @@ bin/sql-client.sh -f data-generator.sql
 ### Flink Yarn per job mode
 
 TODO
+
+### RocksDB State
+
+**Get & compile RocksDB**
+```bash
+git clone -b FRocksDB-6.20.3 https://github.com/ververica/frocksdb.git
+cd frocksdb
+make rocksdbjava -i
+```
+
+**Config RocksDB backend**
+- copy compiled jar package to `${FLINK_HOME}/gluten_lib` directory.
+    ```bash
+    cp ${ROCKSDB_COMPILE_DIR}/java/target/rocksdbjni-6.20.3-linux64.jar ${FLINK_HOME}/gluten_lib
+    ```
+- modify `${FLINK_HOME}/bin/config.sh` as follows
+    ```
+    GLUTEN_JAR="$FLINK_HOME/gluten_lib/gluten-flink-loader-1.6.0.jar:$FLINK_HOME/gluten_lib/velox4j-0.1.0-SNAPSHOT.jar:$FLINK_HOME/gluten_lib/gluten-flink-runtime-1.6.0.jar:$FLINK_HOME/gluten_lib/rocksdbjni-6.20.3-linux64.jar"
+    echo "$GLUTEN_JAR""$FLINK_CLASSPATH""$FLINK_DIST"
+    ```
+- set rocksdb config in `${FLINK_HOME}/conf/config.yaml`
+    ```
+    state.backend.type: rocksdb
+    ```
 
 ## Performance
 We are working on supporting the [Nexmark](https://github.com/nexmark/nexmark) benchmark for Flink.
