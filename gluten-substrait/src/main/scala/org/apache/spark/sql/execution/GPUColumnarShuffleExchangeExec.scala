@@ -53,8 +53,11 @@ case class GPUColumnarShuffleExchangeExec(
 
   override def getShuffleWriterType: ShuffleWriterType = GpuHashShuffleWriterType
 
-  protected def withNewChildInternal(newChild: SparkPlan): GPUColumnarShuffleExchangeExec =
-    copy(child = newChild)
+  protected def withNewChildInternal(newChild: SparkPlan): GPUColumnarShuffleExchangeExec = {
+    val newExec = copy(child = newChild)
+    newExec.vanillaExchange = vanillaExchange
+    newExec
+  }
 }
 
 object GPUColumnarShuffleExchangeExec extends Logging {
@@ -63,12 +66,14 @@ object GPUColumnarShuffleExchangeExec extends Logging {
       plan: ShuffleExchangeExec,
       child: SparkPlan,
       shuffleOutputAttributes: Seq[Attribute]): GPUColumnarShuffleExchangeExec = {
-    GPUColumnarShuffleExchangeExec(
+    val result = GPUColumnarShuffleExchangeExec(
       plan.outputPartitioning,
       child,
       plan.shuffleOrigin,
       shuffleOutputAttributes,
       advisoryPartitionSize = SparkShimLoader.getSparkShims.getShuffleAdvisoryPartitionSize(plan)
     )
+    result.vanillaExchange = plan
+    result
   }
 }

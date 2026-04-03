@@ -17,10 +17,35 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.GlutenSQLTestsBaseTrait
-import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec}
+import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.internal.SQLConf
 
 class GlutenExchangeSuite extends ExchangeSuite with GlutenSQLTestsBaseTrait {
+
+  testGluten("ColumnarShuffleExchangeExec canonicalizes to ShuffleExchangeExec type") {
+    // Verify that ColumnarShuffleExchangeExec.canonicalized produces a ShuffleExchangeExec,
+    // not a ColumnarShuffleExchangeExec. This is critical for AQE stage cache reuse:
+    // the cache first-check uses ShuffleExchangeExec.canonicalized as key, so the canonical
+    // form must be type-compatible.
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "5") {
+      val df = sql("SELECT key, value FROM testData JOIN testData2 ON key = a")
+      val plan = df.queryExecution.executedPlan
+      val columnarExchanges = plan.collect { case e: ColumnarShuffleExchangeExecBase => e }
+      assert(columnarExchanges.nonEmpty, "Expected ColumnarShuffleExchangeExec in plan")
+      columnarExchanges.foreach {
+        exchange =>
+          val canonicalized = exchange.canonicalized
+          assert(
+            canonicalized.isInstanceOf[ShuffleExchangeExec],
+            s"ColumnarShuffleExchangeExec.canonicalized should be ShuffleExchangeExec, " +
+              s"but was ${canonicalized.getClass.getSimpleName}"
+          )
+      }
+    }
+  }
 
   testGluten("Exchange reuse across the whole plan with shuffle partition 2") {
     // The shuffle exchange will be inserted between Aggregate

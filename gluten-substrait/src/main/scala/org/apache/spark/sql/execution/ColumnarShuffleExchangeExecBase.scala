@@ -42,6 +42,20 @@ abstract class ColumnarShuffleExchangeExecBase(
     projectOutputAttributes: Seq[Attribute])
   extends ShuffleExchangeLike
   with ValidatablePlan {
+
+  // Stores the original ShuffleExchangeExec from which this columnar exchange was created.
+  // Used by doCanonicalize() to produce a canonical form that is type-compatible with
+  // ShuffleExchangeExec, enabling AQE stage cache reuse across columnar and vanilla exchanges.
+  @transient private[sql] var vanillaExchange: ShuffleExchangeExec = _
+
+  override def doCanonicalize(): SparkPlan = {
+    if (vanillaExchange != null) {
+      vanillaExchange.canonicalized
+    } else {
+      super.doCanonicalize()
+    }
+  }
+
   private[sql] lazy val writeMetrics =
     SQLShuffleWriteMetricsReporter.createShuffleWriteMetrics(sparkContext)
 
