@@ -34,9 +34,7 @@ case class ColumnarShuffleExchangeExec(
   override def nodeName: String = "ColumnarExchange"
 
   protected def withNewChildInternal(newChild: SparkPlan): ColumnarShuffleExchangeExec = {
-    val newExec = copy(child = newChild)
-    newExec.vanillaExchange = vanillaExchange
-    newExec
+    copy(child = newChild)
   }
 }
 
@@ -46,15 +44,13 @@ object ColumnarShuffleExchangeExec extends Logging {
       plan: ShuffleExchangeExec,
       child: SparkPlan,
       shuffleOutputAttributes: Seq[Attribute]): ColumnarShuffleExchangeExec = {
-    val result = ColumnarShuffleExchangeExec(
+    ColumnarShuffleExchangeExec(
       plan.outputPartitioning,
       child,
       plan.shuffleOrigin,
       shuffleOutputAttributes,
       advisoryPartitionSize = SparkShimLoader.getSparkShims.getShuffleAdvisoryPartitionSize(plan)
     )
-    result.vanillaExchange = plan
-    result
   }
 
 }

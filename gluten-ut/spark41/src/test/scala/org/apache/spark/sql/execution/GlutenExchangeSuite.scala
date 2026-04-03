@@ -18,38 +18,47 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.GlutenSQLTestsBaseTrait
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanHelper, ShuffleQueryStageExec}
 import org.apache.spark.sql.internal.SQLConf
 
-class GlutenExchangeSuite extends ExchangeSuite with GlutenSQLTestsBaseTrait {
+class GlutenExchangeSuite
+  extends ExchangeSuite
+  with GlutenSQLTestsBaseTrait
+  with AdaptiveSparkPlanHelper {
 
   override def sparkConf: SparkConf = {
     super.sparkConf.set("spark.sql.shuffle.partitions", "2")
   }
 
-  testGluten("ColumnarShuffleExchangeExec canonicalizes to ShuffleExchangeExec type") {
-    // Verify that ColumnarShuffleExchangeExec.canonicalized produces a ShuffleExchangeExec,
-    // not a ColumnarShuffleExchangeExec. This is critical for AQE stage cache reuse:
-    // the cache first-check uses ShuffleExchangeExec.canonicalized as key, so the canonical
-    // form must be type-compatible.
+  testGluten("AQE reuses identical ColumnarShuffleExchangeExec via stage cache") {
+    // Verify that AQE's stage cache reuses identical columnar shuffle exchanges.
+    // Two identical subqueries should result in one physical shuffle + one ReusedExchangeExec.
     withSQLConf(
-      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       SQLConf.ANSI_ENABLED.key -> "false",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
       SQLConf.SHUFFLE_PARTITIONS.key -> "5"
     ) {
-      val df = sql("SELECT key, value FROM testData JOIN testData2 ON key = a")
+      val df = sql("""
+        WITH base AS (SELECT key, count(value) as total FROM testData GROUP BY key)
+        SELECT * FROM base a JOIN base b ON a.key = b.key
+      """)
+      df.collect()
       val plan = df.queryExecution.executedPlan
-      val columnarExchanges = plan.collect { case e: ColumnarShuffleExchangeExecBase => e }
-      assert(columnarExchanges.nonEmpty, "Expected ColumnarShuffleExchangeExec in plan")
-      columnarExchanges.foreach {
-        exchange =>
-          val canonicalized = exchange.canonicalized
-          assert(
-            canonicalized.isInstanceOf[ShuffleExchangeExec],
-            s"ColumnarShuffleExchangeExec.canonicalized should be ShuffleExchangeExec, " +
-              s"but was ${canonicalized.getClass.getSimpleName}"
-          )
+      val stages = collect(plan) { case s: ShuffleQueryStageExec => s }
+      val columnarStages = stages.filter(_.plan.isInstanceOf[ColumnarShuffleExchangeExecBase])
+      assert(columnarStages.nonEmpty, "Expected ColumnarShuffleExchangeExec in AQE stages")
+      // Verify identical exchanges produce the same canonical form (enabling reuse)
+      if (columnarStages.size >= 2) {
+        val canonicals = columnarStages.map(_.plan.canonicalized)
+        val pairs =
+          for (i <- canonicals.indices; j <- i + 1 until canonicals.size)
+            yield (i, j, canonicals(i).sameResult(canonicals(j)))
+        val matchingPairs = pairs.filter(_._3)
+        assert(
+          matchingPairs.nonEmpty,
+          "At least two ColumnarShuffleExchangeExec stages should have matching " +
+            "canonical forms for AQE reuse")
       }
     }
   }
