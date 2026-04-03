@@ -414,8 +414,12 @@ class GlutenReuseExchangeAndSubquerySuite
    * Spark behavior for comparison.
    */
   private def withGlutenDisabled[T](f: => T): T = {
+    var result: Option[T] = None
     withSQLConf(
       "spark.gluten.enabled" -> "false"
-    )(f)
+    ) {
+      result = Some(f)
+    }
+    result.get
   }
 }
