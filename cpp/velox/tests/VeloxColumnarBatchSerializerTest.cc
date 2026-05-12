@@ -75,4 +75,37 @@ TEST_F(VeloxColumnarBatchSerializerTest, serialize) {
   test::assertEqualVectors(vector, deserializedVector);
 }
 
+// PA-2.1 RED: computeStats() Long FlatVector min/max scan.
+//
+// Scope: a single Long FlatVector column (no nulls), values [42, 7, 99, -3, 50].
+// Expected stats[0]: hasLowerBound=true, hasUpperBound=true,
+//                    lowerBound=-3, upperBound=99, nullCount=0.
+//
+// Expected RED failure: VeloxColumnarBatchSerializer::computeStats() does not
+// exist yet -- compilation fails with:
+//   error: 'class gluten::VeloxColumnarBatchSerializer' has no member named 'computeStats'
+//
+// PA-2 GREEN will add ColumnStats struct + computeStats(rowVector) member that
+// runs DecodedVector scan and fills per-column stats. This RED locks the
+// minimal contract before adding NaN / nulls-buffer-absent / Decimal cases.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_2_1_testComputeStatsLongFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int64_t>({42, 7, 99, -3, 50}),
+  };
+  auto vector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(vector);
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  auto stats = serializer->computeStats(vector);
+
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound);
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int64_t>(), -3);
+  EXPECT_EQ(stats[0].upperBound.value<int64_t>(), 99);
+  EXPECT_EQ(stats[0].nullCount, 0);
+}
+
 } // namespace gluten
