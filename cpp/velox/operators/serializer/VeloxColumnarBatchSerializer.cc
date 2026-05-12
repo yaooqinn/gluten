@@ -19,6 +19,8 @@
 
 #include <arrow/buffer.h>
 
+#include <cmath>
+
 #include "memory/ArrowMemory.h"
 #include "memory/VeloxColumnarBatch.h"
 #include "velox/common/memory/Memory.h"
@@ -95,6 +97,48 @@ std::shared_ptr<ColumnarBatch> VeloxColumnarBatchSerializer::deserialize(uint8_t
   return std::make_shared<VeloxColumnarBatch>(result);
 }
 
+namespace {
+
+// Per-type FlatVector min/max scan + NaN guard. Returns false if column
+// must be marked unsupported (any NaN observed for floating-point types).
+template <typename T>
+bool scanMinMax(
+    const facebook::velox::FlatVector<T>* flat,
+    T& tLo,
+    T& tHi,
+    int64_t& nullCnt,
+    bool& seen) {
+  const auto size = flat->size();
+  const uint64_t* nulls = flat->rawNulls();
+  const T* values = flat->rawValues();
+  for (vector_size_t i = 0; i < size; ++i) {
+    if (nulls != nullptr && bits::isBitNull(nulls, i)) {
+      ++nullCnt;
+      continue;
+    }
+    T v = values[i];
+    if constexpr (std::is_floating_point_v<T>) {
+      // NaN poisons the whole column: Spark equality (NaN != NaN) means
+      // min/max-based pruning would silently drop matching rows. NB4
+      // ship blocker.
+      if (std::isnan(v)) {
+        return false;
+      }
+    }
+    if (!seen) {
+      tLo = v;
+      tHi = v;
+      seen = true;
+    } else {
+      if (v < tLo) tLo = v;
+      if (v > tHi) tHi = v;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr rowVector) {
   std::vector<ColumnStats> result;
   const auto numCols = rowVector->childrenSize();
@@ -102,48 +146,43 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
   for (column_index_t col = 0; col < numCols; ++col) {
     auto& stats = result[col];
     auto child = rowVector->childAt(col);
-    if (child == nullptr) {
+    if (child == nullptr || !child->isFlatEncoding()) {
       continue;
     }
-    // PA-2.1 scope: BIGINT (int64) FlatVector only. Other types fall back to
-    // unsupported (hasLowerBound = hasUpperBound = false) which downstream
-    // surfaces as buildFilter pass-through for that column.
-    if (child->typeKind() != TypeKind::BIGINT || !child->isFlatEncoding()) {
-      continue;
-    }
-    auto* flat = child->asFlatVector<int64_t>();
-    const auto size = flat->size();
-    if (size == 0) {
-      continue;
-    }
-    const uint64_t* nulls = flat->rawNulls();
-    const int64_t* values = flat->rawValues();
     bool seen = false;
-    int64_t lo = 0;
-    int64_t hi = 0;
     int64_t nullCnt = 0;
-    for (vector_size_t i = 0; i < size; ++i) {
-      if (nulls != nullptr && bits::isBitNull(nulls, i)) {
-        ++nullCnt;
-        continue;
+    bool supported = false;
+    switch (child->typeKind()) {
+      case TypeKind::BIGINT: {
+        auto* flat = child->asFlatVector<int64_t>();
+        int64_t lo = 0, hi = 0;
+        supported = scanMinMax<int64_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
       }
-      int64_t v = values[i];
-      if (!seen) {
-        lo = v;
-        hi = v;
-        seen = true;
-      } else {
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
+      case TypeKind::REAL: {
+        auto* flat = child->asFlatVector<float>();
+        float lo = 0.f, hi = 0.f;
+        supported = scanMinMax<float>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
       }
+      default:
+        // Other types deferred to later micro-slices (Integer / Double / String /
+        // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
+        break;
     }
     stats.nullCount = nullCnt;
-    if (seen) {
-      stats.hasLowerBound = true;
-      stats.hasUpperBound = true;
-      stats.lowerBound = variant(lo);
-      stats.upperBound = variant(hi);
-    }
   }
   return result;
 }
