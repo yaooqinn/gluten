@@ -246,4 +246,99 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLay
       << "framed total size must match magic + statsLen + statsBlob + bytesLen + bytesBlob";
 }
 
+// PA-2.5b RED: statsBlob layout per docs/0003-jni-binary-framing-reference.md sec 3.
+//
+//   [ numCols: uint32 LE ]
+//   per col:
+//     [ supported: uint8 ]
+//     [ nullCount: uint32 LE ]
+//     [ count: uint32 LE ]                  <- = rowVector->size()
+//     [ sizeInBytes: uint64 LE ]            <- 0 placeholder in PA-2.5b
+//     if supported:
+//       [ lowerBoundLen: uint32 LE ][ lowerBound bytes ]
+//       [ upperBoundLen: uint32 LE ][ upperBound bytes ]
+//
+// PA-2.5b scope: 1-col BIGINT path only. lowerBound/upperBound = int64 LE 8 bytes.
+// REAL/HUGEINT marshaling deferred to follow-up micro-slices (PA-2.5b-real /
+// PA-2.5b-hugeint) -- one type per RED stays honest under Plan sec 0 rule 1.
+//
+// Expected RED failure: PA-2.5a writes statsLen=0 (empty statsBlob); the
+// PA-2.5b assertions read numCols=1 from the first 4 bytes of statsBlob and
+// will fail (statsBlob is empty -> ASSERT_GE(statsLen, 4u) fires).
+TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int64_t>({42, 7, 99, -3, 50}),
+  };
+  auto vector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(vector);
+
+  std::vector<uint8_t> framed = serializer->framedSerializeWithStats(batch);
+  ASSERT_GE(framed.size(), 12u);
+
+  // Skip magic(4) header; read statsLen LE.
+  uint32_t statsLen = static_cast<uint32_t>(framed[4]) |
+                      (static_cast<uint32_t>(framed[5]) << 8) |
+                      (static_cast<uint32_t>(framed[6]) << 16) |
+                      (static_cast<uint32_t>(framed[7]) << 24);
+  ASSERT_GE(statsLen, 4u) << "PA-2.5b: statsBlob must contain at least numCols(uint32)";
+
+  // statsBlob starts at offset 8.
+  auto readU32LE = [&](size_t off) {
+    return static_cast<uint32_t>(framed[off]) |
+        (static_cast<uint32_t>(framed[off + 1]) << 8) |
+        (static_cast<uint32_t>(framed[off + 2]) << 16) |
+        (static_cast<uint32_t>(framed[off + 3]) << 24);
+  };
+  auto readU64LE = [&](size_t off) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) {
+      v |= static_cast<uint64_t>(framed[off + i]) << (8 * i);
+    }
+    return v;
+  };
+  auto readI64LE = [&](size_t off) { return static_cast<int64_t>(readU64LE(off)); };
+
+  size_t off = 8;
+  uint32_t numCols = readU32LE(off);
+  off += 4;
+  EXPECT_EQ(numCols, 1u);
+
+  // Per-col header.
+  uint8_t supported = framed[off];
+  off += 1;
+  EXPECT_EQ(supported, 1u) << "BIGINT no-null col must be supported";
+
+  uint32_t nullCount = readU32LE(off);
+  off += 4;
+  EXPECT_EQ(nullCount, 0u);
+
+  uint32_t count = readU32LE(off);
+  off += 4;
+  EXPECT_EQ(count, 5u) << "count = rowVector->size()";
+
+  uint64_t sizeInBytes = readU64LE(off);
+  off += 8;
+  EXPECT_EQ(sizeInBytes, 0u) << "PA-2.5b uses 0 placeholder for sizeInBytes";
+
+  // lowerBound: BIGINT -> 8 bytes int64 LE = -3.
+  uint32_t lowerLen = readU32LE(off);
+  off += 4;
+  EXPECT_EQ(lowerLen, 8u);
+  EXPECT_EQ(readI64LE(off), -3);
+  off += lowerLen;
+
+  // upperBound: 8 bytes int64 LE = 99.
+  uint32_t upperLen = readU32LE(off);
+  off += 4;
+  EXPECT_EQ(upperLen, 8u);
+  EXPECT_EQ(readI64LE(off), 99);
+  off += upperLen;
+
+  // statsBlob ends exactly at off (no trailing bytes within statsBlob).
+  EXPECT_EQ(off, 8u + statsLen) << "statsBlob content must exactly match statsLen";
+}
+
 } // namespace gluten
