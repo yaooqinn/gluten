@@ -26,11 +26,10 @@ import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.utils.ArrowAbiUtil
 import org.apache.gluten.vectorized.ColumnarBatchSerializerJniWrapper
 
-import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
-import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer, SimpleMetricsCachedBatch}
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.columnar.{CachedBatch, SimpleMetricsCachedBatch, SimpleMetricsCachedBatchSerializer}
 import org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{StructField, StructType}
@@ -55,9 +54,9 @@ import org.apache.arrow.c.ArrowSchema
  * supported column) per the SimpleMetricsCachedBatch contract (SPARK-32274). `null` indicates stats
  * unavailable (e.g. v1 binary read or stats compute disabled); the serializer's buildFilter
  * override uses a lazy-split iterator wrapper to direct stats=null batches through (skipping
- * vanilla partition pruning) -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` would
- * NPE on `partitionFilter.eval(null)` for non-trivial predicates (both codegen and interpreted
- * paths; no fallback). See todos/features/gluten-inmemory-cache-stats/investigations/
+ * vanilla partition pruning) -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` would NPE
+ * on `partitionFilter.eval(null)` for non-trivial predicates (both codegen and interpreted paths;
+ * no fallback). See todos/features/gluten-inmemory-cache-stats/investigations/
  * 0003-simplemetrics-buildfilter-survey.md rev 2 for the spark-shell evidence.
  *
  * Use eager `val` (not `lazy val`) for stats to keep Kryo round-trip deterministic. Note: trait
@@ -103,11 +102,11 @@ case class CachedColumnarBatch(
  * high byte (= `(numRows >>> 24) & 0xff`) in [0x00, 0x7F]. The magic's first byte 0xFE > 0x7F is
  * unreachable, so any v1 binary's first byte is <= 0x7F < 0xFE -- disjoint from the magic.
  *
- * v1 binary read produces stats=null -> buildFilter override uses lazy-split iterator wrapper
- * to direct such batches through, skipping vanilla partition pruning (Spark Streaming
- * checkpoint cross-version safe). NOTE: the prior comment "falls back to pass-through
- * (graceful degrade)" was wrong -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter`
- * NPEs on `partitionFilter.eval(null)`. See investigations/0003 rev 2 for evidence.
+ * v1 binary read produces stats=null -> buildFilter override uses lazy-split iterator wrapper to
+ * direct such batches through, skipping vanilla partition pruning (Spark Streaming checkpoint
+ * cross-version safe). NOTE: the prior comment "falls back to pass-through (graceful degrade)" was
+ * wrong -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` NPEs on
+ * `partitionFilter.eval(null)`. See investigations/0003 rev 2 for evidence.
  *
  * NOTE (PA-1 scope): PA-1 write path always emits stats=null (see L347-350). The hasStats=true
  * branch + serializeStats/deserializeStats placeholders are inert in PA-1; PA-3 will (a) populate
@@ -267,7 +266,7 @@ object CachedColumnarBatchKryoSerializer {
  *     -> Convert DefaultCachedBatch to InternalRow using vanilla Spark serializer
  */
 // format: on
-class ColumnarCachedBatchSerializer extends CachedBatchSerializer with Logging {
+class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
   private lazy val rowBasedCachedBatchSerializer = new DefaultCachedBatchSerializer
 
   private def glutenConf: GlutenConfig = GlutenConfig.get
@@ -448,10 +447,8 @@ class ColumnarCachedBatchSerializer extends CachedBatchSerializer with Logging {
     }
   }
 
-  override def buildFilter(
-      predicates: Seq[Expression],
-      cachedAttributes: Seq[Attribute]): (Int, Iterator[CachedBatch]) => Iterator[CachedBatch] = {
-    // TODO, support build filter as we did not support collect min/max value for columnar batch
-    (_, it) => it
-  }
+  // PA-3.1 RED: removed the pre-PA-3 TODO override `(_, it) => it`.
+  // Base class SimpleMetricsCachedBatchSerializer.buildFilter is inherited as-is,
+  // which NPEs on stats=null (v1 binary read path). PA-3.1 GREEN will add the
+  // lazy-split iterator wrapper to fix.
 }
