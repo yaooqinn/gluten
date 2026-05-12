@@ -485,12 +485,16 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
             val handle =
               ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch)
             // PA-3.3: route through serializeWithStats when the JNI extension is
-            // available (cpp PA-2.5c). Capability is cached after first probe
+            // available (cpp PA-2.5c) AND the partition-stats conf is enabled
+            // (PA-4 default-off ship gate). Capability is cached after first probe
             // (gluten-arrow PA-2.6 helper). When unavailable -- e.g. running
-            // against an older cpp libgluten.so -- fall back to the original
-            // serialize() path and emit stats=null; PA-3.1 lazy-split iterator
-            // wrapper will then direct such batches through without pruning.
-            if (ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
+            // against an older cpp libgluten.so, or when the conf is left off --
+            // fall back to the original serialize() path and emit stats=null;
+            // PA-3.1 lazy-split iterator wrapper will then direct such batches
+            // through without pruning.
+            val partitionStatsEnabled =
+              GlutenConfig.get.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED)
+            if (partitionStatsEnabled && ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
               val framed = jni.serializeWithStats(handle)
               val (stats, bytesBlob) =
                 CachedColumnarBatchKryoSerializer.parseFramedBytes(framed)

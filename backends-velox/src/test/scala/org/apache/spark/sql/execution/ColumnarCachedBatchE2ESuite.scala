@@ -54,6 +54,7 @@ class ColumnarCachedBatchE2ESuite
       .set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.ColumnarShuffleManager")
       .set("spark.sql.shuffle.partitions", "4")
       .set(GlutenConfig.COLUMNAR_TABLE_CACHE_ENABLED.key, "true")
+      .set(GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED.key, "true")
   }
 
   // Build a deterministic, range-partitioned cached frame:
