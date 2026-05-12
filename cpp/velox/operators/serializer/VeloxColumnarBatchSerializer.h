@@ -22,8 +22,21 @@
 #include "memory/ColumnarBatch.h"
 #include "operators/serializer/ColumnarBatchSerializer.h"
 #include "velox/serializers/PrestoSerializer.h"
+#include "velox/type/Variant.h"
 
 namespace gluten {
+
+// PA-2 ColumnStats: minimal per-column min/max + nullCount carrier consumed
+// by the JVM cache stats marshaling (Layer A). PA-2.1 fills BIGINT; later
+// micro-slices add other scalar types. Unsupported / NaN-poisoned columns
+// emit hasLowerBound=hasUpperBound=false (graceful degrade for buildFilter).
+struct ColumnStats {
+  bool hasLowerBound{false};
+  bool hasUpperBound{false};
+  facebook::velox::variant lowerBound;
+  facebook::velox::variant upperBound;
+  int64_t nullCount{0};
+};
 
 class VeloxColumnarBatchSerializer : public ColumnarBatchSerializer {
  public:
@@ -39,6 +52,11 @@ class VeloxColumnarBatchSerializer : public ColumnarBatchSerializer {
   void serializeTo(uint8_t* address, int64_t size) override;
 
   std::shared_ptr<ColumnarBatch> deserialize(uint8_t* data, int32_t size) override;
+
+  // PA-2.1 GREEN: per-column min/max scan. Scalar v1 -- only BIGINT FlatVector
+  // returns hasLowerBound/UpperBound=true. All other types fall back to
+  // hasLowerBound=hasUpperBound=false (buildFilter pass-through).
+  std::vector<ColumnStats> computeStats(facebook::velox::RowVectorPtr rowVector);
 
  protected:
   std::shared_ptr<facebook::velox::memory::MemoryPool> veloxPool_;

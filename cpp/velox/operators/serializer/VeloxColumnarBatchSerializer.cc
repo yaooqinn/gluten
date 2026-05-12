@@ -95,4 +95,57 @@ std::shared_ptr<ColumnarBatch> VeloxColumnarBatchSerializer::deserialize(uint8_t
   return std::make_shared<VeloxColumnarBatch>(result);
 }
 
+std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr rowVector) {
+  std::vector<ColumnStats> result;
+  const auto numCols = rowVector->childrenSize();
+  result.resize(numCols);
+  for (column_index_t col = 0; col < numCols; ++col) {
+    auto& stats = result[col];
+    auto child = rowVector->childAt(col);
+    if (child == nullptr) {
+      continue;
+    }
+    // PA-2.1 scope: BIGINT (int64) FlatVector only. Other types fall back to
+    // unsupported (hasLowerBound = hasUpperBound = false) which downstream
+    // surfaces as buildFilter pass-through for that column.
+    if (child->typeKind() != TypeKind::BIGINT || !child->isFlatEncoding()) {
+      continue;
+    }
+    auto* flat = child->asFlatVector<int64_t>();
+    const auto size = flat->size();
+    if (size == 0) {
+      continue;
+    }
+    const uint64_t* nulls = flat->rawNulls();
+    const int64_t* values = flat->rawValues();
+    bool seen = false;
+    int64_t lo = 0;
+    int64_t hi = 0;
+    int64_t nullCnt = 0;
+    for (vector_size_t i = 0; i < size; ++i) {
+      if (nulls != nullptr && bits::isBitNull(nulls, i)) {
+        ++nullCnt;
+        continue;
+      }
+      int64_t v = values[i];
+      if (!seen) {
+        lo = v;
+        hi = v;
+        seen = true;
+      } else {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+    stats.nullCount = nullCnt;
+    if (seen) {
+      stats.hasLowerBound = true;
+      stats.hasUpperBound = true;
+      stats.lowerBound = variant(lo);
+      stats.upperBound = variant(hi);
+    }
+  }
+  return result;
+}
+
 } // namespace gluten
