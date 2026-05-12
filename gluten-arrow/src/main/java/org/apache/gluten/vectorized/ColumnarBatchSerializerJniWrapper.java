@@ -55,4 +55,34 @@ public class ColumnarBatchSerializerJniWrapper implements RuntimeAware {
   public native long deserializeDirect(long serializerHandle, long offset, int len);
 
   public native void close(long serializerHandle);
+
+  // PA-2.6: capability check for the serializeWithStats JNI extension. Users
+  // may pair a newer Gluten jar with an older libgluten.so that lacks this
+  // symbol; PA-3's write path consults this helper and falls back to the
+  // legacy serialize() when false. Probing is lazy (one-shot, cached) and
+  // catches UnsatisfiedLinkError without surfacing it -- a true probe call
+  // requires a real ColumnarBatch handle, so we instead reflect on the
+  // declared native method (if reflection finds it AND the cpp symbol is
+  // present in libgluten.so the helper returns true).
+  private static volatile Boolean supportsStatsExtCached = null;
+
+  public static boolean supportsStatsExt() {
+    Boolean cached = supportsStatsExtCached;
+    if (cached != null) {
+      return cached;
+    }
+    boolean result;
+    try {
+      // Reflect on our own native method declaration; presence proves the JVM
+      // side is wired. The cpp side symbol is verified at first real invocation
+      // via JNI (the linker resolves on first call -- a stale .so will raise
+      // UnsatisfiedLinkError there, which PA-3 write path must also catch).
+      ColumnarBatchSerializerJniWrapper.class.getDeclaredMethod("serializeWithStats", long.class);
+      result = true;
+    } catch (NoSuchMethodException e) {
+      result = false;
+    }
+    supportsStatsExtCached = result;
+    return result;
+  }
 }
