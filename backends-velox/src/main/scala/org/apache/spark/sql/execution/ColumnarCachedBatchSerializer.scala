@@ -54,7 +54,11 @@ import org.apache.arrow.c.ArrowSchema
  * `stats` carries per-partition column statistics (min/max/nullCount/count/sizeInBytes per
  * supported column) per the SimpleMetricsCachedBatch contract (SPARK-32274). `null` indicates stats
  * unavailable (e.g. v1 binary read or stats compute disabled); the serializer's buildFilter
- * override will fall back to pass-through in that case.
+ * override uses a lazy-split iterator wrapper to direct stats=null batches through (skipping
+ * vanilla partition pruning) -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` would
+ * NPE on `partitionFilter.eval(null)` for non-trivial predicates (both codegen and interpreted
+ * paths; no fallback). See todos/features/gluten-inmemory-cache-stats/investigations/
+ * 0003-simplemetrics-buildfilter-survey.md rev 2 for the spark-shell evidence.
  *
  * Use eager `val` (not `lazy val`) for stats to keep Kryo round-trip deterministic. Note: trait
  * SimpleMetricsCachedBatch's default `sizeInBytes` sums per-column stats slots; we override with
@@ -99,8 +103,11 @@ case class CachedColumnarBatch(
  * high byte (= `(numRows >>> 24) & 0xff`) in [0x00, 0x7F]. The magic's first byte 0xFE > 0x7F is
  * unreachable, so any v1 binary's first byte is <= 0x7F < 0xFE -- disjoint from the magic.
  *
- * v1 binary read produces stats=null -> buildFilter override falls back to pass-through (graceful
- * degrade; Spark Streaming checkpoint cross-version safe).
+ * v1 binary read produces stats=null -> buildFilter override uses lazy-split iterator wrapper
+ * to direct such batches through, skipping vanilla partition pruning (Spark Streaming
+ * checkpoint cross-version safe). NOTE: the prior comment "falls back to pass-through
+ * (graceful degrade)" was wrong -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter`
+ * NPEs on `partitionFilter.eval(null)`. See investigations/0003 rev 2 for evidence.
  *
  * NOTE (PA-1 scope): PA-1 write path always emits stats=null (see L347-350). The hasStats=true
  * branch + serializeStats/deserializeStats placeholders are inert in PA-1; PA-3 will (a) populate
