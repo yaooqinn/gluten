@@ -177,6 +177,18 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
+      case TypeKind::HUGEINT: {
+        auto* flat = child->asFlatVector<int128_t>();
+        int128_t lo = 0, hi = 0;
+        supported = scanMinMax<int128_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
       default:
         // Other types deferred to later micro-slices (Integer / Double / String /
         // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
