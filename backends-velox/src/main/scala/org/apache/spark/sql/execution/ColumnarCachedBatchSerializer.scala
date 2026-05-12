@@ -28,7 +28,7 @@ import org.apache.gluten.vectorized.ColumnarBatchSerializerJniWrapper
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.columnar.{CachedBatch, SimpleMetricsCachedBatch, SimpleMetricsCachedBatchSerializer}
 import org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer
 import org.apache.spark.sql.internal.SQLConf
@@ -447,8 +447,63 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
     }
   }
 
-  // PA-3.1 RED: removed the pre-PA-3 TODO override `(_, it) => it`.
-  // Base class SimpleMetricsCachedBatchSerializer.buildFilter is inherited as-is,
-  // which NPEs on stats=null (v1 binary read path). PA-3.1 GREEN will add the
-  // lazy-split iterator wrapper to fix.
+  // PA-3.1 GREEN: lazy-split iterator wrapper. stats=null batches (v1 binary
+  // read path, or PA-4 SQLConf-off write path) are directed through unchanged
+  // (skipping vanilla partition pruning); stats!=null batches are fed to the
+  // inherited parent buildFilter. Without this guard, parent's
+  // partitionFilter.eval(stats=null) NPEs on non-trivial predicates -- see
+  // todos/features/gluten-inmemory-cache-stats/investigations/0003-...md rev 2
+  // evidence 3 (both codegen and interpreted paths NPE, no fallback). A naive
+  // occupier-row placeholder fails differently (silent drop, evidence 3.A);
+  // only this lazy-split wrapper preserves correctness.
+  override def buildFilter(
+      predicates: Seq[Expression],
+      cachedAttributes: Seq[Attribute])
+      : (Int, Iterator[CachedBatch]) => Iterator[CachedBatch] = {
+    val parent = super.buildFilter(predicates, cachedAttributes)
+    (index, cachedBatchIterator) =>
+      new Iterator[CachedBatch] {
+        // Buffered so we can peek stats without consuming.
+        private val peekable = cachedBatchIterator.buffered
+        // When the head is stats != null, drain a contiguous run through
+        // parent and buffer it here so hasNext can answer accurately.
+        private var staged: Iterator[CachedBatch] = Iterator.empty
+
+        override def hasNext: Boolean = staged.hasNext || peekable.hasNext
+
+        override def next(): CachedBatch = {
+          if (staged.hasNext) {
+            staged.next()
+          } else {
+            val head = peekable.head
+            val stats = head match {
+              case ccb: CachedColumnarBatch => ccb.stats
+              case smcb: SimpleMetricsCachedBatch => smcb.stats
+              case _ => null
+            }
+            if (stats == null) {
+              // Pass through, do NOT feed to parent (would NPE).
+              peekable.next()
+            } else {
+              // Drain contiguous run of stats!=null batches and route through
+              // parent. Lazy: only takes batches as parent's returned iterator
+              // pulls. We give parent a self-terminating sub-iterator.
+              val runIt = new Iterator[CachedBatch] {
+                override def hasNext: Boolean = peekable.hasNext && {
+                  val s = peekable.head match {
+                    case ccb: CachedColumnarBatch => ccb.stats
+                    case smcb: SimpleMetricsCachedBatch => smcb.stats
+                    case _ => null
+                  }
+                  s != null
+                }
+                override def next(): CachedBatch = peekable.next()
+              }
+              staged = parent(index, runIt)
+              next()
+            }
+          }
+        }
+      }
+  }
 }
