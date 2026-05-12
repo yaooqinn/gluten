@@ -597,12 +597,11 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
         // parent and buffer it here so hasNext can answer accurately.
         private var staged: Iterator[CachedBatch] = Iterator.empty
 
-        override def hasNext: Boolean = staged.hasNext || peekable.hasNext
-
-        override def next(): CachedBatch = {
-          if (staged.hasNext) {
-            staged.next()
-          } else {
+        // Advance until either staged has an element ready, or peekable is
+        // drained. Called from hasNext so it is idempotent and safe to call
+        // even after the iterator is exhausted.
+        private def advance(): Unit = {
+          while (!staged.hasNext && peekable.hasNext) {
             val head = peekable.head
             val stats = head match {
               case ccb: CachedColumnarBatch => ccb.stats
@@ -610,8 +609,9 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
               case _ => null
             }
             if (stats == null) {
-              // Pass through, do NOT feed to parent (would NPE).
-              peekable.next()
+              // Pass through: load the staged buffer with this single batch
+              // (do NOT feed to parent, which would NPE on null stats).
+              staged = Iterator.single(peekable.next())
             } else {
               // Drain contiguous run of stats!=null batches and route through
               // parent. Lazy: only takes batches as parent's returned iterator
@@ -628,9 +628,20 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
                 override def next(): CachedBatch = peekable.next()
               }
               staged = parent(index, runIt)
-              next()
+              // If parent pruned every batch in the run, loop and check
+              // peekable again -- next batch may be stats=null pass-through.
             }
           }
+        }
+
+        override def hasNext: Boolean = {
+          advance()
+          staged.hasNext
+        }
+
+        override def next(): CachedBatch = {
+          advance()
+          staged.next()
         }
       }
   }

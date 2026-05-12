@@ -1,0 +1,114 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution
+
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, EqualTo, GenericInternalRow, Literal}
+import org.apache.spark.sql.columnar.CachedBatch
+import org.apache.spark.sql.types.LongType
+
+import org.scalatest.funsuite.AnyFunSuite
+
+/**
+ * PA-3.4 RED tests for the lazy-split wrapper's stats!=null branch: batches with stats whose
+ * [lowerBound, upperBound] does NOT cover the literal MUST be pruned; batches whose range covers
+ * the literal MUST be returned.
+ *
+ * This locks down the read-side semantics promised by the design (D-A3 lazy split +
+ * super.buildFilter for stats!=null batches). PA-3.1 only covered stats=null direct-through;
+ * PA-3.2/3.3 added marshal/parser but no end-to-end filter-by-stats assertion.
+ *
+ * Refs:
+ *   - todos/features/gluten-inmemory-cache-stats/docs/0001-layerA-minmax-design.md rev 4 D-A3
+ *   - todos/features/gluten-inmemory-cache-stats/investigations/
+ *     0003-simplemetrics-buildfilter-survey.md rev 2
+ *
+ * Pure JVM. Uses GenericInternalRow with vanilla 5-slot/col schema (lower, upper, nullCount, count,
+ * sizeInBytes per col).
+ */
+class ColumnarCachedBatchBuildFilterPruneSuite extends AnyFunSuite {
+
+  // Build a CachedColumnarBatch with BIGINT 1-col stats [lower, upper].
+  private def batchWithStats(numRows: Int, lower: Long, upper: Long): CachedColumnarBatch = {
+    val stats = new GenericInternalRow(Array[Any](lower, upper, 0, numRows, numRows * 8L))
+    CachedColumnarBatch(
+      numRows = numRows,
+      sizeInBytes = numRows * 8L,
+      bytes = Array.fill[Byte](numRows * 4)(0),
+      stats = stats)
+  }
+
+  // PA-3.4.A: EqualTo literal IN range -> batch is kept.
+  // Expected RED: PA-3.1 wrapper passes stats != null batches to parent
+  // buildFilter; this assertion locks the kept behavior. Pre-PA-3.4 there
+  // was no test exercising stats != null path at all -- this is the first
+  // regression sentinel for the kept-branch contract.
+  test("PA-3.4.A EqualTo literal in [lower, upper] keeps the batch") {
+    val serializer = new ColumnarCachedBatchSerializer
+    val attr = AttributeReference("id", LongType, nullable = false)()
+    val predicate = EqualTo(attr, Literal(50L))
+    val filter = serializer.buildFilter(Seq(predicate), Seq(attr))
+
+    val batches: Iterator[CachedBatch] = Iterator(batchWithStats(10, 0L, 100L))
+    val result = filter(0, batches).toList
+
+    assert(result.length === 1, "batch with [0, 100] covers literal 50, must be kept")
+    assert(result.head.numRows === 10)
+  }
+
+  // PA-3.4.B: EqualTo literal OUT of range -> batch is pruned.
+  test("PA-3.4.B EqualTo literal outside [lower, upper] prunes the batch") {
+    val serializer = new ColumnarCachedBatchSerializer
+    val attr = AttributeReference("id", LongType, nullable = false)()
+    val predicate = EqualTo(attr, Literal(999L))
+    val filter = serializer.buildFilter(Seq(predicate), Seq(attr))
+
+    val batches: Iterator[CachedBatch] = Iterator(batchWithStats(10, 0L, 100L))
+    val result = filter(0, batches).toList
+
+    assert(result.length === 0, "batch with [0, 100] cannot contain 999, must be pruned")
+  }
+
+  // PA-3.4.C: mixed stream of stats=null + stats!=null batches.
+  // stats=null directs through unconditionally; stats!=null is pruned by predicate.
+  // Locks the lazy-split iterator's interleave correctness from PA-3.1.
+  test("PA-3.4.C mixed null/non-null stats: null through, non-null pruned by predicate") {
+    val serializer = new ColumnarCachedBatchSerializer
+    val attr = AttributeReference("id", LongType, nullable = false)()
+    val predicate = EqualTo(attr, Literal(50L))
+    val filter = serializer.buildFilter(Seq(predicate), Seq(attr))
+
+    val nullStats = CachedColumnarBatch(
+      numRows = 7,
+      sizeInBytes = 28L,
+      bytes = Array[Byte](9, 9),
+      stats = null)
+    val keptBatch = batchWithStats(10, 0L, 100L) // covers 50, kept
+    val prunedBatch = batchWithStats(5, 200L, 300L) // does not cover 50, pruned
+
+    val batches: Iterator[CachedBatch] = Iterator(nullStats, prunedBatch, keptBatch)
+    val result = filter(0, batches).toList
+
+    // Expected order: nullStats first (direct), then keptBatch.
+    // prunedBatch dropped by parent.
+    assert(
+      result.length === 2,
+      s"expected 2 (nullStats + keptBatch), got ${result.length}")
+    assert(
+      result.map(_.numRows) === Seq(7, 10),
+      "order: stats=null pass-through first, then stats-covers-literal kept")
+  }
+}
