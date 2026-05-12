@@ -201,41 +201,79 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
 
 std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
     const std::shared_ptr<ColumnarBatch>& batch) {
-  // Step 1: produce bytesBlob via existing serializer path (append + serializeTo).
+  // Step 1: compute stats over the inbound rowVector BEFORE delegating to the
+  // append path (which may consume / mutate iterator state on subsequent calls).
+  auto rowVector = VeloxColumnarBatch::from(veloxPool_.get(), batch)->getRowVector();
+  const uint32_t numRows = static_cast<uint32_t>(rowVector->size());
+  std::vector<ColumnStats> perCol = computeStats(rowVector);
+  const uint32_t numCols = static_cast<uint32_t>(perCol.size());
+
+  // Step 2: marshal statsBlob per docs/0003 sec 3. Helpers append LE primitives.
+  std::vector<uint8_t> statsBlob;
+  auto pushU8 = [&](uint8_t v) { statsBlob.push_back(v); };
+  auto pushU32 = [&](uint32_t v) {
+    statsBlob.push_back(static_cast<uint8_t>(v & 0xFF));
+    statsBlob.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    statsBlob.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    statsBlob.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+  auto pushU64 = [&](uint64_t v) {
+    for (int i = 0; i < 8; ++i) {
+      statsBlob.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    }
+  };
+  auto pushI64LE = [&](int64_t v) { pushU64(static_cast<uint64_t>(v)); };
+
+  pushU32(numCols);
+  for (const auto& s : perCol) {
+    // PA-2.5b: only BIGINT lowerBound/upperBound is currently emitted as 8B LE.
+    // REAL / HUGEINT marshaling lands in follow-up slices. For now treat any
+    // non-int64 variant as unsupported even if computeStats reported supported
+    // (so we don't desync wire format with parsers expecting 8B for BIGINT).
+    bool emitSupported = s.hasLowerBound && s.hasUpperBound &&
+        s.lowerBound.kind() == facebook::velox::TypeKind::BIGINT &&
+        s.upperBound.kind() == facebook::velox::TypeKind::BIGINT;
+    pushU8(emitSupported ? 1 : 0);
+    pushU32(static_cast<uint32_t>(s.nullCount));
+    pushU32(numRows);  // count = rowVector->size()
+    pushU64(0);        // sizeInBytes placeholder (PA-2.5b)
+    if (emitSupported) {
+      pushU32(8);
+      pushI64LE(s.lowerBound.value<int64_t>());
+      pushU32(8);
+      pushI64LE(s.upperBound.value<int64_t>());
+    }
+  }
+  const uint32_t statsLen = static_cast<uint32_t>(statsBlob.size());
+
+  // Step 3: produce bytesBlob via existing serializer path.
   append(batch);
   const int64_t bytesLen = maxSerializedSize();
   std::vector<uint8_t> bytesBlob(bytesLen);
   serializeTo(bytesBlob.data(), bytesLen);
 
-  // Step 2: PA-2.5a uses an EMPTY statsBlob; PA-2.5b will populate from computeStats.
-  const uint32_t statsLen = 0;
-
-  // Step 3: assemble [magic(4) | statsLen(4 LE) | statsBlob | bytesLen(4 LE) | bytesBlob].
+  // Step 4: assemble [magic(4) | statsLen(4 LE) | statsBlob | bytesLen(4 LE) | bytesBlob].
   std::vector<uint8_t> framed;
   framed.reserve(4 + 4 + statsLen + 4 + bytesLen);
 
-  // magic: 0xFE 0xCA 0x53 0x02 (matches JVM Kryo V2_MAGIC).
   framed.push_back(0xFE);
   framed.push_back(0xCA);
   framed.push_back(0x53);
   framed.push_back(0x02);
 
-  // statsLen LE.
   framed.push_back(static_cast<uint8_t>(statsLen & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 8) & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 16) & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 24) & 0xFF));
 
-  // statsBlob: empty in PA-2.5a.
+  framed.insert(framed.end(), statsBlob.begin(), statsBlob.end());
 
-  // bytesLen LE.
   const uint32_t bytesLen32 = static_cast<uint32_t>(bytesLen);
   framed.push_back(static_cast<uint8_t>(bytesLen32 & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 8) & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 16) & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 24) & 0xFF));
 
-  // bytesBlob.
   framed.insert(framed.end(), bytesBlob.begin(), bytesBlob.end());
   return framed;
 }

@@ -227,12 +227,12 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLay
   EXPECT_EQ(framed[2], static_cast<uint8_t>(0x53));
   EXPECT_EQ(framed[3], static_cast<uint8_t>(0x02));
 
-  // statsLen LE int32 -- PA-2.5a: empty statsBlob (PA-2.5b fills it).
+  // statsLen LE int32 -- post PA-2.5b this is non-zero. PA-2.5a only asserts
+  // the layout shape (offsets / framing), not the numeric statsLen value.
   uint32_t statsLen = static_cast<uint32_t>(framed[4]) |
                       (static_cast<uint32_t>(framed[5]) << 8) |
                       (static_cast<uint32_t>(framed[6]) << 16) |
                       (static_cast<uint32_t>(framed[7]) << 24);
-  EXPECT_EQ(statsLen, 0u) << "PA-2.5a: statsBlob is empty (PA-2.5b adds marshaling)";
 
   // bytesLen LE int32 immediately after empty statsBlob.
   size_t bytesLenOffset = 8u + statsLen;
