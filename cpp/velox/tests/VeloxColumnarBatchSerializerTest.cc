@@ -28,6 +28,8 @@
 
 #include <arrow/buffer.h>
 
+#include <limits>
+
 using namespace facebook::velox;
 
 namespace gluten {
@@ -106,6 +108,54 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_1_testComputeStatsLongFlatVector) 
   EXPECT_EQ(stats[0].lowerBound.value<int64_t>(), -3);
   EXPECT_EQ(stats[0].upperBound.value<int64_t>(), 99);
   EXPECT_EQ(stats[0].nullCount, 0);
+}
+
+// PA-2.2 RED: NaN Float partition must NOT participate in pruning.
+//
+// Scope: a single REAL (float) FlatVector with one NaN value. Per Spark
+// equality semantics, NaN != NaN, so a partition containing any NaN must
+// emit hasLowerBound=hasUpperBound=false (graceful unsupported -- buildFilter
+// pass-through for that column). This is NB4 ship blocker invariant.
+//
+// Expected RED failure: PA-2.1 GREEN ONLY handles BIGINT; REAL falls through
+// to the unsupported branch -- so hasLowerBound=false is already TRUE for
+// any REAL column. We must DISTINGUISH the new NaN-poisoned semantics from
+// the trivial "REAL not yet supported" pass-through. The RED locks REAL with
+// NO NaN values returns hasLowerBound=true (i.e. REAL becomes supported),
+// AND NaN poisoning re-disables it. PA-2.2 GREEN adds REAL scan + NaN guard.
+//
+// Expected RED compile failure: REAL scan path not implemented, so case (a)
+// (REAL no NaN) fails the EXPECT_TRUE assertion (actual=false != expected=true).
+TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartition) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // (a) REAL FlatVector NO NaN -- min/max well-defined, should be supported.
+  {
+    std::vector<VectorPtr> children = {
+        makeFlatVector<float>({1.5f, 2.5f, 0.5f, 3.5f}),
+    };
+    auto vector = makeRowVector(children);
+    auto stats = serializer->computeStats(vector);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_TRUE(stats[0].hasLowerBound)
+        << "REAL FlatVector w/o NaN must be supported after PA-2.2 GREEN";
+    EXPECT_TRUE(stats[0].hasUpperBound);
+  }
+
+  // (b) REAL FlatVector WITH NaN -- must fall back to unsupported.
+  {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<VectorPtr> children = {
+        makeFlatVector<float>({1.5f, nan, 3.5f}),
+    };
+    auto vector = makeRowVector(children);
+    auto stats = serializer->computeStats(vector);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_FALSE(stats[0].hasLowerBound)
+        << "NaN-poisoned REAL column must emit hasLowerBound=false (NB4)";
+    EXPECT_FALSE(stats[0].hasUpperBound);
+  }
 }
 
 } // namespace gluten
