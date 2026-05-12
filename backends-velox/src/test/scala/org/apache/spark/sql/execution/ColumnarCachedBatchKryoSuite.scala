@@ -72,8 +72,16 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
   // Expected RED failure: compile error "stats is not a member of
   // CachedColumnarBatch" / "too many arguments" until case class gains the
   // stats field AND extends SimpleMetricsCachedBatch trait.
+  // PA-3.2 RED case: PA-1.1 was using 2-field placeholder stats (42L, 100L)
+  // which does not match the vanilla 5-slots-per-col PartitionStatistics
+  // schema (lowerBound, upperBound, nullCount, count, sizeInBytes). PA-3.2
+  // production change replaces Java Serialization with statsBlob binary
+  // framing aligned to the vanilla schema; this also requires PA-1.1 to use
+  // a 5-field stats row. Updated to BIGINT 1-col: lower=42, upper=100,
+  // nullCount=0, count=10, sizeInBytes=64.
   test("PA-1.1 testStatsFieldRoundTripV2") {
-    val stats: InternalRow = new GenericInternalRow(Array[Any](42L, 100L))
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](42L, 100L, 0, 10, 64L))
     val batch = CachedColumnarBatch(
       numRows = 10,
       sizeInBytes = 64L,
@@ -86,9 +94,12 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.sizeInBytes === 64L)
     assert(read.bytes === Array[Byte](1, 2, 3, 4))
     assert(read.stats !== null, "stats field must round-trip")
-    assert(read.stats.numFields === 2)
-    assert(read.stats.getLong(0) === 42L)
-    assert(read.stats.getLong(1) === 100L)
+    assert(read.stats.numFields === 5, "vanilla PartitionStatistics = 5 slots / col")
+    assert(read.stats.getLong(0) === 42L, "lowerBound at slot 0")
+    assert(read.stats.getLong(1) === 100L, "upperBound at slot 1")
+    assert(read.stats.getInt(2) === 0, "nullCount at slot 2")
+    assert(read.stats.getInt(3) === 10, "count at slot 3")
+    assert(read.stats.getLong(4) === 64L, "sizeInBytes at slot 4")
   }
 
   // Helper: write a v1 (pre-PA-1) binary using the same Kryo wire conventions
