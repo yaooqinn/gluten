@@ -201,39 +201,109 @@ object CachedColumnarBatchKryoSerializer {
   val V2_MAGIC: Array[Byte] =
     Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x02.toByte)
 
-  // PA-1 placeholder: PA-1 write path always emits stats=null, so these helpers
-  // are inert in PA-1. PA-3 will replace with statsBlob binary framing (per
-  // contract 0002 sec 3 + reference 0003 sec 3-4 per-type marshal). Java serialization
-  // is NOT a stable cross-version Spark Streaming checkpoint format and MUST
-  // be removed before any code path can produce stats != null.
+  // PA-3.2: statsBlob binary framing, aligned with cpp end
+  // (cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5b
+  // helper). Layout (LE throughout, no schemaVer prefix to match cpp):
+  //
+  //   [ numCols: uint32 LE ]
+  //   per col:
+  //     [ supported: uint8 ]            // 1 if hasLower && hasUpper
+  //     [ nullCount: uint32 LE ]
+  //     [ count: uint32 LE ]
+  //     [ sizeInBytes: uint64 LE ]
+  //     if supported:
+  //       [ lowerBoundLen: uint32 LE = 8 ]   // PA-3.2 v1: BIGINT only
+  //       [ lowerBound: int64 LE ]
+  //       [ upperBoundLen: uint32 LE = 8 ]
+  //       [ upperBound: int64 LE ]
+  //
+  // PA-3.2 scope: BIGINT 1-col only (matches cpp PA-2.5b). Multi-col + other
+  // types land in PA-3.3 / PA-3.5 / follow-up. The vanilla
+  // SimpleMetricsCachedBatch.stats InternalRow layout is per-col 5 slots in
+  // order (lowerBound, upperBound, nullCount, count, sizeInBytes) per docs/0003
+  // sec 3 + investigations/0003 rev 2 evidence 2. PA-1 placeholder used 2
+  // slots; PA-3.2 + test update align with vanilla.
   private[execution] def serializeStats(stats: InternalRow): Array[Byte] = {
+    require(
+      stats.numFields % 5 == 0,
+      s"stats InternalRow numFields=${stats.numFields} must be a multiple of 5 " +
+        s"(vanilla PartitionStatistics schema = 5 slots per column)"
+    )
+    val numCols = stats.numFields / 5
     val baos = new java.io.ByteArrayOutputStream()
-    try {
-      val oos = new java.io.ObjectOutputStream(baos)
-      try {
-        oos.writeObject(stats)
-      } finally {
-        oos.close()
+    writeU32LE(baos, numCols)
+    var col = 0
+    while (col < numCols) {
+      val base = col * 5
+      val hasLower = !stats.isNullAt(base)
+      val hasUpper = !stats.isNullAt(base + 1)
+      val supported = hasLower && hasUpper
+      baos.write(if (supported) 1 else 0)
+      writeU32LE(baos, if (stats.isNullAt(base + 2)) 0 else stats.getInt(base + 2))
+      writeU32LE(baos, if (stats.isNullAt(base + 3)) 0 else stats.getInt(base + 3))
+      writeU64LE(baos, if (stats.isNullAt(base + 4)) 0L else stats.getLong(base + 4))
+      if (supported) {
+        writeU32LE(baos, 8)
+        writeI64LE(baos, stats.getLong(base))
+        writeU32LE(baos, 8)
+        writeI64LE(baos, stats.getLong(base + 1))
       }
-      baos.toByteArray
-    } finally {
-      baos.close()
+      col += 1
+    }
+    baos.toByteArray
+  }
+
+  private[execution] def deserializeStats(blob: Array[Byte]): InternalRow = {
+    val buf = java.nio.ByteBuffer.wrap(blob).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    val numCols = buf.getInt
+    require(
+      numCols >= 0 && numCols <= 4096,
+      s"corrupt statsBlob: numCols=$numCols out of valid range [0, 4096]")
+    val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(numCols * 5)
+    var col = 0
+    while (col < numCols) {
+      val base = col * 5
+      val supported = buf.get()
+      val nullCount = buf.getInt
+      val count = buf.getInt
+      val sizeInBytes = buf.getLong
+      if (supported == 1) {
+        val lowerLen = buf.getInt
+        require(
+          lowerLen == 8,
+          s"PA-3.2 only supports BIGINT 8-byte lowerBound, got $lowerLen")
+        row.update(base, buf.getLong)
+        val upperLen = buf.getInt
+        require(
+          upperLen == 8,
+          s"PA-3.2 only supports BIGINT 8-byte upperBound, got $upperLen")
+        row.update(base + 1, buf.getLong)
+      }
+      row.update(base + 2, nullCount)
+      row.update(base + 3, count)
+      row.update(base + 4, sizeInBytes)
+      col += 1
+    }
+    row
+  }
+
+  private def writeU32LE(out: java.io.ByteArrayOutputStream, v: Int): Unit = {
+    out.write(v & 0xff)
+    out.write((v >>> 8) & 0xff)
+    out.write((v >>> 16) & 0xff)
+    out.write((v >>> 24) & 0xff)
+  }
+
+  private def writeU64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit = {
+    var i = 0
+    while (i < 8) {
+      out.write(((v >>> (8 * i)) & 0xffL).toInt)
+      i += 1
     }
   }
 
-  private[execution] def deserializeStats(bytes: Array[Byte]): InternalRow = {
-    val bais = new java.io.ByteArrayInputStream(bytes)
-    try {
-      val ois = new java.io.ObjectInputStream(bais)
-      try {
-        ois.readObject().asInstanceOf[InternalRow]
-      } finally {
-        ois.close()
-      }
-    } finally {
-      bais.close()
-    }
-  }
+  private def writeI64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit =
+    writeU64LE(out, v)
 }
 
 // format: off
