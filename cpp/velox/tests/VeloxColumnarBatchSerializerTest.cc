@@ -193,4 +193,57 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFl
   EXPECT_EQ(stats[0].upperBound.value<int128_t>(), static_cast<int128_t>(9999));
 }
 
+// PA-2.5a RED: framedSerializeWithStats top-level layout.
+//
+// Helper returns std::vector<uint8_t> framed as:
+//   [ magic(4) | statsLen(4 LE) | statsBlob (statsLen bytes) | bytesLen(4 LE) | bytesBlob (bytesLen bytes) ]
+//
+// magic = 0xFE 0xCA 0x53 0x02 (matches V2_MAGIC of JVM Kryo serializer; downstream
+// JVM parses framed bytes with magic-prefix sniff that already exists in PA-1).
+//
+// PA-2.5a scope: framing layout + bytesBlob (delegated to existing serializer)
+// + EMPTY statsBlob (statsLen = 0). Per-column stats marshaling is PA-2.5b.
+//
+// Expected RED failure: framedSerializeWithStats() does not exist yet ->
+// compile error 'no member named framedSerializeWithStats'.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLayout) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+  };
+  auto vector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(vector);
+
+  std::vector<uint8_t> framed = serializer->framedSerializeWithStats(batch);
+
+  // Top-level layout: at least magic(4) + statsLen(4) + bytesLen(4) = 12 bytes header.
+  ASSERT_GE(framed.size(), 12u);
+
+  // Magic bytes 0xFE 0xCA 0x53 0x02.
+  EXPECT_EQ(framed[0], static_cast<uint8_t>(0xFE));
+  EXPECT_EQ(framed[1], static_cast<uint8_t>(0xCA));
+  EXPECT_EQ(framed[2], static_cast<uint8_t>(0x53));
+  EXPECT_EQ(framed[3], static_cast<uint8_t>(0x02));
+
+  // statsLen LE int32 -- PA-2.5a: empty statsBlob (PA-2.5b fills it).
+  uint32_t statsLen = static_cast<uint32_t>(framed[4]) |
+                      (static_cast<uint32_t>(framed[5]) << 8) |
+                      (static_cast<uint32_t>(framed[6]) << 16) |
+                      (static_cast<uint32_t>(framed[7]) << 24);
+  EXPECT_EQ(statsLen, 0u) << "PA-2.5a: statsBlob is empty (PA-2.5b adds marshaling)";
+
+  // bytesLen LE int32 immediately after empty statsBlob.
+  size_t bytesLenOffset = 8u + statsLen;
+  ASSERT_GE(framed.size(), bytesLenOffset + 4u);
+  uint32_t bytesLen = static_cast<uint32_t>(framed[bytesLenOffset]) |
+                      (static_cast<uint32_t>(framed[bytesLenOffset + 1]) << 8) |
+                      (static_cast<uint32_t>(framed[bytesLenOffset + 2]) << 16) |
+                      (static_cast<uint32_t>(framed[bytesLenOffset + 3]) << 24);
+  EXPECT_GT(bytesLen, 0u) << "bytesBlob must contain serialized batch payload";
+  EXPECT_EQ(framed.size(), bytesLenOffset + 4u + bytesLen)
+      << "framed total size must match magic + statsLen + statsBlob + bytesLen + bytesBlob";
+}
+
 } // namespace gluten
