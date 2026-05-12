@@ -58,6 +58,12 @@ class VeloxColumnarBatchSerializer : public ColumnarBatchSerializer {
   // hasLowerBound=hasUpperBound=false (buildFilter pass-through).
   std::vector<ColumnStats> computeStats(facebook::velox::RowVectorPtr rowVector);
 
+  // PA-2.5a GREEN: framed bytes carrying [magic | statsLen | statsBlob | bytesLen | bytesBlob],
+  // where bytesBlob is the existing serializer payload and statsBlob is currently empty
+  // (PA-2.5b will populate it from computeStats output). magic = 0xFE 0xCA 0x53 0x02
+  // matches the JVM Kryo V2_MAGIC for PA-1 round-trip. Layout in docs/0003 sec 2.
+  std::vector<uint8_t> framedSerializeWithStats(const std::shared_ptr<ColumnarBatch>& batch);
+
  protected:
   std::shared_ptr<facebook::velox::memory::MemoryPool> veloxPool_;
   std::unique_ptr<facebook::velox::StreamArena> arena_;

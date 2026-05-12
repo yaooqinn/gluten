@@ -199,4 +199,45 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
   return result;
 }
 
+std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
+    const std::shared_ptr<ColumnarBatch>& batch) {
+  // Step 1: produce bytesBlob via existing serializer path (append + serializeTo).
+  append(batch);
+  const int64_t bytesLen = maxSerializedSize();
+  std::vector<uint8_t> bytesBlob(bytesLen);
+  serializeTo(bytesBlob.data(), bytesLen);
+
+  // Step 2: PA-2.5a uses an EMPTY statsBlob; PA-2.5b will populate from computeStats.
+  const uint32_t statsLen = 0;
+
+  // Step 3: assemble [magic(4) | statsLen(4 LE) | statsBlob | bytesLen(4 LE) | bytesBlob].
+  std::vector<uint8_t> framed;
+  framed.reserve(4 + 4 + statsLen + 4 + bytesLen);
+
+  // magic: 0xFE 0xCA 0x53 0x02 (matches JVM Kryo V2_MAGIC).
+  framed.push_back(0xFE);
+  framed.push_back(0xCA);
+  framed.push_back(0x53);
+  framed.push_back(0x02);
+
+  // statsLen LE.
+  framed.push_back(static_cast<uint8_t>(statsLen & 0xFF));
+  framed.push_back(static_cast<uint8_t>((statsLen >> 8) & 0xFF));
+  framed.push_back(static_cast<uint8_t>((statsLen >> 16) & 0xFF));
+  framed.push_back(static_cast<uint8_t>((statsLen >> 24) & 0xFF));
+
+  // statsBlob: empty in PA-2.5a.
+
+  // bytesLen LE.
+  const uint32_t bytesLen32 = static_cast<uint32_t>(bytesLen);
+  framed.push_back(static_cast<uint8_t>(bytesLen32 & 0xFF));
+  framed.push_back(static_cast<uint8_t>((bytesLen32 >> 8) & 0xFF));
+  framed.push_back(static_cast<uint8_t>((bytesLen32 >> 16) & 0xFF));
+  framed.push_back(static_cast<uint8_t>((bytesLen32 >> 24) & 0xFF));
+
+  // bytesBlob.
+  framed.insert(framed.end(), bytesBlob.begin(), bytesBlob.end());
+  return framed;
+}
+
 } // namespace gluten
