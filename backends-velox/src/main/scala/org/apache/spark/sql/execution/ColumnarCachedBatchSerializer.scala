@@ -30,7 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
-import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer}
+import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer, SimpleMetricsCachedBatch}
 import org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{StructField, StructType}
@@ -50,16 +50,70 @@ import org.apache.arrow.c.ArrowSchema
  * {{{
  *   spark.kryo.classesToRegister=org.apache.spark.sql.execution.CachedColumnarBatch
  * }}}
+ *
+ * `stats` carries per-partition column statistics (min/max/nullCount/count/sizeInBytes per
+ * supported column) per the SimpleMetricsCachedBatch contract (SPARK-32274). `null` indicates stats
+ * unavailable (e.g. v1 binary read or stats compute disabled); the serializer's buildFilter
+ * override will fall back to pass-through in that case.
+ *
+ * Use eager `val` (not `lazy val`) for stats to keep Kryo round-trip deterministic. Note: trait
+ * SimpleMetricsCachedBatch's default `sizeInBytes` sums per-column stats slots; we override with
+ * the serialized blob length here for cache eviction accounting (Velox JNI serialize byte[] length
+ * is the real off-heap footprint), not vanilla per-column-sum semantics.
  */
 @DefaultSerializer(classOf[CachedColumnarBatchKryoSerializer])
 case class CachedColumnarBatch(
     override val numRows: Int,
     override val sizeInBytes: Long,
-    bytes: Array[Byte])
-  extends CachedBatch {}
+    bytes: Array[Byte],
+    override val stats: InternalRow)
+  extends SimpleMetricsCachedBatch
 
+/**
+ * Kryo serializer for [[CachedColumnarBatch]] with magic-prefix versioning.
+ *
+ * v2 binary layout (current):
+ * {{{
+ *   [V2_MAGIC: 4 bytes 0xFE 0xCA 0x53 0x02]
+ *   [numRows: Int (Kryo fixed 4-byte BIG-ENDIAN, via Output.writeInt(int))]
+ *   [sizeInBytes: Long]
+ *   [bytes.length+1: Int (Kryo fixed 4-byte BE, +1 to distinguish Kryo.NULL)]
+ *   [bytes: bytes.length bytes]
+ *   [hasStats: Boolean]
+ *   if hasStats:
+ *     [statsLen: Int]
+ *     [statsBytes: statsLen bytes -- Layer A PA-3 will define statsBlob layout
+ *      (see contract 0002 sec 3 + reference 0003 sec 3-4); PA-1 always writes stats=null]
+ * }}}
+ *
+ * v1 binary layout (legacy, no stats field, pre-PA-1):
+ * {{{
+ *   [numRows: Int (Kryo fixed 4-byte BE)]
+ *   [sizeInBytes: Long]
+ *   [bytes.length+1: Int]
+ *   [bytes]
+ * }}}
+ *
+ * Read path uses 4-byte magic-prefix sniff. Magic `0xFECA5302` cannot collide with any v1 binary:
+ * v1's first 4 bytes are numRows (Kryo fixed 4-byte BE), and any non-negative Int < 2^31 has BE
+ * high byte (= `(numRows >>> 24) & 0xff`) in [0x00, 0x7F]. The magic's first byte 0xFE > 0x7F is
+ * unreachable, so any v1 binary's first byte is <= 0x7F < 0xFE -- disjoint from the magic.
+ *
+ * v1 binary read produces stats=null -> buildFilter override falls back to pass-through (graceful
+ * degrade; Spark Streaming checkpoint cross-version safe).
+ *
+ * NOTE (PA-1 scope): PA-1 write path always emits stats=null (see L347-350). The hasStats=true
+ * branch + serializeStats/deserializeStats placeholders are inert in PA-1; PA-3 will (a) populate
+ * stats from cpp computeStats output, (b) replace serializeStats placeholder with statsBlob binary
+ * framing.
+ */
 class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBatch] {
+
   override def write(kryo: Kryo, output: Output, batch: CachedColumnarBatch): Unit = {
+    output.writeBytes(CachedColumnarBatchKryoSerializer.V2_MAGIC)
+    // Kryo fixed 4-byte BE (single-arg overload). Avoid (int, boolean) overload
+    // which silently forwards to writeVarInt (1-5 bytes) and breaks the magic
+    // sniff invariant.
     output.writeInt(batch.numRows)
     output.writeLong(batch.sizeInBytes)
     require(
@@ -68,12 +122,30 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
         s"serialize using ${this.getClass.getName}")
     output.writeInt(batch.bytes.length + 1) // +1 to distinguish Kryo.NULL
     output.writeBytes(batch.bytes)
+    if (batch.stats == null) {
+      output.writeBoolean(false)
+    } else {
+      output.writeBoolean(true)
+      val statsBytes = CachedColumnarBatchKryoSerializer.serializeStats(batch.stats)
+      output.writeInt(statsBytes.length)
+      output.writeBytes(statsBytes)
+    }
   }
 
   override def read(
       kryo: Kryo,
       input: Input,
       cls: Class[CachedColumnarBatch]): CachedColumnarBatch = {
+    val first4 = new Array[Byte](4)
+    input.readBytes(first4)
+    if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
+      readV2(input)
+    } else {
+      readV1(input, first4)
+    }
+  }
+
+  private def readV2(input: Input): CachedColumnarBatch = {
     val numRows = input.readInt()
     val sizeInBytes = input.readLong()
     val length = input.readInt()
@@ -81,9 +153,80 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       length != Kryo.NULL,
       "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
         s"deserialize using ${this.getClass.getName}")
-    val bytes = new Array[Byte](length - 1) // -1 to restore
+    val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
-    CachedColumnarBatch(numRows, sizeInBytes, bytes)
+    val hasStats = input.readBoolean()
+    val stats: InternalRow = if (hasStats) {
+      val statsLen = input.readInt()
+      val statsBytes = new Array[Byte](statsLen)
+      input.readBytes(statsBytes)
+      CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes)
+    } else {
+      null
+    }
+    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats)
+  }
+
+  private def readV1(input: Input, first4: Array[Byte]): CachedColumnarBatch = {
+    // first4 contains numRows in Kryo fixed 4-byte BE (legacy layout pre-PA-1).
+    val numRows =
+      ((first4(0) & 0xff) << 24) |
+        ((first4(1) & 0xff) << 16) |
+        ((first4(2) & 0xff) << 8) |
+        (first4(3) & 0xff)
+    val sizeInBytes = input.readLong()
+    val length = input.readInt()
+    require(
+      length != Kryo.NULL,
+      "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
+        s"deserialize using ${this.getClass.getName}")
+    val bytes = new Array[Byte](length - 1)
+    input.readBytes(bytes)
+    // stats=null -> buildFilter override falls back to pass-through (graceful degrade).
+    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats = null)
+  }
+}
+
+object CachedColumnarBatchKryoSerializer {
+  // V2_MAGIC = 0xFE 0xCA 0x53 0x02. Cannot collide with v1 binary because v1's
+  // first 4 bytes are numRows (Kryo fixed 4-byte BE) and any non-negative Int
+  // < 2^31 has BE high byte in [0x00, 0x7F]. Magic high byte 0xFE > 0x7F is
+  // structurally unreachable, so any v1 first byte is <= 0x7F < 0xFE -- disjoint.
+  val V2_MAGIC: Array[Byte] =
+    Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x02.toByte)
+
+  // PA-1 placeholder: PA-1 write path always emits stats=null, so these helpers
+  // are inert in PA-1. PA-3 will replace with statsBlob binary framing (per
+  // contract 0002 sec 3 + reference 0003 sec 3-4 per-type marshal). Java serialization
+  // is NOT a stable cross-version Spark Streaming checkpoint format and MUST
+  // be removed before any code path can produce stats != null.
+  private[execution] def serializeStats(stats: InternalRow): Array[Byte] = {
+    val baos = new java.io.ByteArrayOutputStream()
+    try {
+      val oos = new java.io.ObjectOutputStream(baos)
+      try {
+        oos.writeObject(stats)
+      } finally {
+        oos.close()
+      }
+      baos.toByteArray
+    } finally {
+      baos.close()
+    }
+  }
+
+  private[execution] def deserializeStats(bytes: Array[Byte]): InternalRow = {
+    val bais = new java.io.ByteArrayInputStream(bytes)
+    try {
+      val ois = new java.io.ObjectInputStream(bais)
+      try {
+        ois.readObject().asInstanceOf[InternalRow]
+      } finally {
+        ois.close()
+      }
+    } finally {
+      bais.close()
+    }
   }
 }
 
@@ -220,7 +363,9 @@ class ColumnarCachedBatchSerializer extends CachedBatchSerializer with Logging {
                   "ColumnarCachedBatchSerializer#serialize"))
               .serialize(ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch))
             val bytes = unsafeBuffer.toByteArray
-            CachedColumnarBatch(batch.numRows(), bytes.length, bytes)
+            // PA-1: stats=null placeholder. PA-3 will replace with stats InternalRow
+            // built from cpp computeStats output (via JNI serializeWithStats).
+            CachedColumnarBatch(batch.numRows(), bytes.length, bytes, stats = null)
           }
         }
     }
