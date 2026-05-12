@@ -158,4 +158,39 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartitio
   }
 }
 
+// PA-2.4 RED: Decimal(P>=19) -> HUGEINT (int128_t) FlatVector min/max.
+//
+// Scope: a single LongDecimal(20, 4) FlatVector, values [100, -50, 9999].
+// Expected stats[0]: hasLowerBound=true, hasUpperBound=true,
+//                    lowerBound = -50 (as int128_t), upperBound = 9999.
+//
+// PA-2.3 (nulls-buffer-absent) is folded into PA-5 ship blocker UT batch
+// (existing GREEN code already has `if (nulls != nullptr)` defensive guard;
+// no honest RED can be authored for an already-correct path -- per Plan
+// sec 0 ironclad rule 2 we do not fake "already green" RED tests).
+//
+// Expected RED failure: PA-2.2 GREEN's switch only covers BIGINT + REAL;
+// HUGEINT lands in the default (unsupported) branch -> hasLowerBound=false.
+// Test asserts EXPECT_TRUE(stats[0].hasLowerBound) which fails.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int128_t>(
+          {static_cast<int128_t>(100),
+           static_cast<int128_t>(-50),
+           static_cast<int128_t>(9999)},
+          DECIMAL(20, 4)),
+  };
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "HUGEINT (long Decimal P>=19) FlatVector must be supported after PA-2.4 GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int128_t>(), static_cast<int128_t>(-50));
+  EXPECT_EQ(stats[0].upperBound.value<int128_t>(), static_cast<int128_t>(9999));
+}
+
 } // namespace gluten
