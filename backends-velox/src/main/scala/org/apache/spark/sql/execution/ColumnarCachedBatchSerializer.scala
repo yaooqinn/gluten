@@ -304,6 +304,52 @@ object CachedColumnarBatchKryoSerializer {
 
   private def writeI64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit =
     writeU64LE(out, v)
+
+  /**
+   * PA-3.3: Parse the JNI `serializeWithStats` framed return into (stats InternalRow, bytesBlob
+   * Array[Byte]).
+   *
+   * Framed layout (matches cpp/velox/operators/serializer/ VeloxColumnarBatchSerializer.cc PA-2.5c
+   * assembled return):
+   *
+   * [ V2_MAGIC: 4 bytes 0xFE 0xCA 0x53 0x02 ] [ statsLen: uint32 LE ] [ statsBlob: statsLen bytes ]
+   * [ bytesLen: uint32 LE ] [ bytesBlob: bytesLen bytes ]
+   *
+   * Eager guards catch corrupt magic / truncated framing before they propagate into a malformed
+   * CachedColumnarBatch.
+   */
+  private[execution] def parseFramedBytes(framed: Array[Byte]): (InternalRow, Array[Byte]) = {
+    require(
+      framed != null && framed.length >= 4 + 4 + 4,
+      s"framed bytes too short: len=${if (framed == null) -1 else framed.length}")
+    require(
+      framed(0) == V2_MAGIC(0) && framed(1) == V2_MAGIC(1) &&
+        framed(2) == V2_MAGIC(2) && framed(3) == V2_MAGIC(3),
+      f"framed bytes magic mismatch: expected " +
+        f"0x${V2_MAGIC(0) & 0xff}%02X${V2_MAGIC(1) & 0xff}%02X" +
+        f"${V2_MAGIC(2) & 0xff}%02X${V2_MAGIC(3) & 0xff}%02X, got " +
+        f"0x${framed(0) & 0xff}%02X${framed(1) & 0xff}%02X" +
+        f"${framed(2) & 0xff}%02X${framed(3) & 0xff}%02X"
+    )
+    val buf = java.nio.ByteBuffer.wrap(framed).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    buf.position(4) // skip magic
+    val statsLen = buf.getInt
+    require(
+      statsLen >= 0 && statsLen <= buf.remaining() - 4,
+      s"framed bytes statsLen=$statsLen exceeds remaining buffer " +
+        s"${buf.remaining() - 4} (truncated?)")
+    val statsBlob = new Array[Byte](statsLen)
+    buf.get(statsBlob)
+    val stats = deserializeStats(statsBlob)
+    val bytesLen = buf.getInt
+    require(
+      bytesLen >= 0 && bytesLen <= buf.remaining(),
+      s"framed bytes bytesLen=$bytesLen exceeds remaining buffer " +
+        s"${buf.remaining()} (truncated?)")
+    val bytesBlob = new Array[Byte](bytesLen)
+    buf.get(bytesBlob)
+    (stats, bytesBlob)
+  }
 }
 
 // format: off
@@ -432,16 +478,28 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
 
           override def next(): CachedBatch = {
             val batch = veloxBatches.next()
-            val unsafeBuffer = ColumnarBatchSerializerJniWrapper
-              .create(
-                Runtimes.contextInstance(
-                  BackendsApiManager.getBackendName,
-                  "ColumnarCachedBatchSerializer#serialize"))
-              .serialize(ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch))
-            val bytes = unsafeBuffer.toByteArray
-            // PA-1: stats=null placeholder. PA-3 will replace with stats InternalRow
-            // built from cpp computeStats output (via JNI serializeWithStats).
-            CachedColumnarBatch(batch.numRows(), bytes.length, bytes, stats = null)
+            val jni = ColumnarBatchSerializerJniWrapper.create(
+              Runtimes.contextInstance(
+                BackendsApiManager.getBackendName,
+                "ColumnarCachedBatchSerializer#serialize"))
+            val handle =
+              ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch)
+            // PA-3.3: route through serializeWithStats when the JNI extension is
+            // available (cpp PA-2.5c). Capability is cached after first probe
+            // (gluten-arrow PA-2.6 helper). When unavailable -- e.g. running
+            // against an older cpp libgluten.so -- fall back to the original
+            // serialize() path and emit stats=null; PA-3.1 lazy-split iterator
+            // wrapper will then direct such batches through without pruning.
+            if (ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
+              val framed = jni.serializeWithStats(handle)
+              val (stats, bytesBlob) =
+                CachedColumnarBatchKryoSerializer.parseFramedBytes(framed)
+              CachedColumnarBatch(batch.numRows(), bytesBlob.length, bytesBlob, stats)
+            } else {
+              val unsafeBuffer = jni.serialize(handle)
+              val bytes = unsafeBuffer.toByteArray
+              CachedColumnarBatch(batch.numRows(), bytes.length, bytes, stats = null)
+            }
           }
         }
     }
