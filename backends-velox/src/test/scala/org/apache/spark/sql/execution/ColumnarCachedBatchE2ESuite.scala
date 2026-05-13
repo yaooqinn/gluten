@@ -173,7 +173,11 @@ class ColumnarCachedBatchE2ESuite
   // (b) ANSI-mode plan fallback breaks the cache hit. Investigation doc:
   // todos/features/gluten-inmemory-cache-stats/investigations/0006-pa5b-float-nan-prune.md
   // Trigger: when Float/Double marshal lands or NaN root cause is fixed.
-  ignore("PA-5.B Float NaN partition: filter on non-NaN not silently pruned (deferred)") {
+  // PA-10 (was PA-5.B): with Float marshal landed, NaN guard at cpp
+  // scanMinMax<float>:124 prevents poisoned bounds. Verify e2e: cache
+  // a Float column with one NaN sprinkled in; query for non-NaN value
+  // must still find it (no silent prune).
+  test("PA-10 Float NaN partition: filter on non-NaN not silently pruned") {
     val df = spark
       .range(N)
       .select(

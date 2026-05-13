@@ -20,6 +20,7 @@
 #include <arrow/buffer.h>
 
 #include <cmath>
+#include <cstring>
 
 #include "memory/ArrowMemory.h"
 #include "memory/VeloxColumnarBatch.h"
@@ -213,6 +214,35 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
+      case TypeKind::DOUBLE: {
+        // PA-10: scanMinMax<double> NaN guard returns false on first NaN
+        // (poisons the column → emit supported=0 to avoid silent wrong prune).
+        auto* flat = child->asFlatVector<double>();
+        double lo = 0.0, hi = 0.0;
+        supported = scanMinMax<double>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
+      case TypeKind::BOOLEAN: {
+        // PA-10: bool min/max via scanMinMax<bool>. Velox stores bool as
+        // packed bits but FlatVector<bool>::rawValues() exposes contiguous
+        // unsigned char buffer; scanMinMax compares 0/1 ints.
+        auto* flat = child->asFlatVector<bool>();
+        bool lo = false, hi = false;
+        supported = scanMinMax<bool>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
       case TypeKind::HUGEINT: {
         // PA-8: restore HUGEINT scan for long-Decimal (precision > 18) marshal.
         // (B4 in PA-6.5 dropped this when emit_gate excluded it; PA-8 wires it
@@ -279,7 +309,10 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::INTEGER ||
          kind == facebook::velox::TypeKind::SMALLINT ||
          kind == facebook::velox::TypeKind::TINYINT ||
-         kind == facebook::velox::TypeKind::HUGEINT);
+         kind == facebook::velox::TypeKind::HUGEINT ||
+         kind == facebook::velox::TypeKind::REAL ||
+         kind == facebook::velox::TypeKind::DOUBLE ||
+         kind == facebook::velox::TypeKind::BOOLEAN);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     pushU32(numRows);  // PA-6.5 B3 (corrected post-Layer-2 #2): vanilla
@@ -329,6 +362,42 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushI128LE(s.lowerBound.value<int128_t>());
           pushU32(16);
           pushI128LE(s.upperBound.value<int128_t>());
+          break;
+        }
+        case facebook::velox::TypeKind::REAL: {
+          // PA-10: 4B IEEE 754 float, little-endian via bit reinterpret.
+          // JVM reconstructs via Float.intBitsToFloat.
+          uint32_t loBits, hiBits;
+          float lo = s.lowerBound.value<float>();
+          float hi = s.upperBound.value<float>();
+          std::memcpy(&loBits, &lo, sizeof(uint32_t));
+          std::memcpy(&hiBits, &hi, sizeof(uint32_t));
+          pushU32(4);
+          pushU32(loBits);
+          pushU32(4);
+          pushU32(hiBits);
+          break;
+        }
+        case facebook::velox::TypeKind::DOUBLE: {
+          // PA-10: 8B IEEE 754 double, little-endian via bit reinterpret.
+          // JVM reconstructs via Double.longBitsToDouble.
+          uint64_t loBits, hiBits;
+          double lo = s.lowerBound.value<double>();
+          double hi = s.upperBound.value<double>();
+          std::memcpy(&loBits, &lo, sizeof(uint64_t));
+          std::memcpy(&hiBits, &hi, sizeof(uint64_t));
+          pushU32(8);
+          pushU64(loBits);
+          pushU32(8);
+          pushU64(hiBits);
+          break;
+        }
+        case facebook::velox::TypeKind::BOOLEAN: {
+          // PA-10: 1B (0 or 1).
+          pushU32(1);
+          pushU8(s.lowerBound.value<bool>() ? 1 : 0);
+          pushU32(1);
+          pushU8(s.upperBound.value<bool>() ? 1 : 0);
           break;
         }
         default:

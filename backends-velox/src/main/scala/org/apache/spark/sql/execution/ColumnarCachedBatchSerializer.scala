@@ -329,6 +329,11 @@ object CachedColumnarBatchKryoSerializer {
       // signed two's-complement. Velox short-vs-long boundary aligns at p=18
       // (Spark) and physical TypeKind::HUGEINT.
       case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 => true
+      // PA-10: Float (4B IEEE 754) / Double (8B) / Boolean (1B). NaN guard
+      // lives in cpp scanMinMax (returns supported=false on first NaN).
+      case org.apache.spark.sql.types.FloatType => true
+      case org.apache.spark.sql.types.DoubleType => true
+      case org.apache.spark.sql.types.BooleanType => true
       case _ => false
     }
 
@@ -430,6 +435,24 @@ object CachedColumnarBatchKryoSerializer {
             writeI128LE(baos, loDec.toJavaBigDecimal.unscaledValue)
             writeU32LE(baos, 16)
             writeI128LE(baos, hiDec.toJavaBigDecimal.unscaledValue)
+          case org.apache.spark.sql.types.FloatType =>
+            // PA-10: 4B IEEE 754 float bits.
+            writeU32LE(baos, 4)
+            writeU32LE(baos, java.lang.Float.floatToRawIntBits(stats.getFloat(base)))
+            writeU32LE(baos, 4)
+            writeU32LE(baos, java.lang.Float.floatToRawIntBits(stats.getFloat(base + 1)))
+          case org.apache.spark.sql.types.DoubleType =>
+            // PA-10: 8B IEEE 754 double bits.
+            writeU32LE(baos, 8)
+            writeU64LE(baos, java.lang.Double.doubleToRawLongBits(stats.getDouble(base)))
+            writeU32LE(baos, 8)
+            writeU64LE(baos, java.lang.Double.doubleToRawLongBits(stats.getDouble(base + 1)))
+          case org.apache.spark.sql.types.BooleanType =>
+            // PA-10: 1B (0/1).
+            writeU32LE(baos, 1)
+            baos.write(if (stats.getBoolean(base)) 1 else 0)
+            writeU32LE(baos, 1)
+            baos.write(if (stats.getBoolean(base + 1)) 1 else 0)
           case other =>
             throw new UnsupportedOperationException(
               s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
@@ -553,6 +576,24 @@ object CachedColumnarBatchKryoSerializer {
                 new java.math.BigDecimal(readI128LE(hiBytes), d.scale),
                 d.precision,
                 d.scale))
+          case org.apache.spark.sql.types.FloatType =>
+            require(lowerLen == 4, s"PA-10 FloatType expects 4B lowerBound, got $lowerLen")
+            row.update(base, java.lang.Float.intBitsToFloat(buf.getInt))
+            val upperLenF = buf.getInt
+            require(upperLenF == 4, s"PA-10 FloatType expects 4B upperBound, got $upperLenF")
+            row.update(base + 1, java.lang.Float.intBitsToFloat(buf.getInt))
+          case org.apache.spark.sql.types.DoubleType =>
+            require(lowerLen == 8, s"PA-10 DoubleType expects 8B lowerBound, got $lowerLen")
+            row.update(base, java.lang.Double.longBitsToDouble(buf.getLong))
+            val upperLenD = buf.getInt
+            require(upperLenD == 8, s"PA-10 DoubleType expects 8B upperBound, got $upperLenD")
+            row.update(base + 1, java.lang.Double.longBitsToDouble(buf.getLong))
+          case org.apache.spark.sql.types.BooleanType =>
+            require(lowerLen == 1, s"PA-10 BooleanType expects 1B lowerBound, got $lowerLen")
+            row.update(base, buf.get != 0)
+            val upperLenB = buf.getInt
+            require(upperLenB == 1, s"PA-10 BooleanType expects 1B upperBound, got $upperLenB")
+            row.update(base + 1, buf.get != 0)
           case other =>
             // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
             // BIGINT physical) or other types not yet in JVM dispatch.
