@@ -314,6 +314,12 @@ object CachedColumnarBatchKryoSerializer {
             writeU32LE(baos, stats.getInt(base))
             writeU32LE(baos, 4)
             writeU32LE(baos, stats.getInt(base + 1))
+          case org.apache.spark.sql.types.ShortType =>
+            // writeU16LE writes 2 LE bytes; signed Short has identical bit pattern.
+            writeU32LE(baos, 2)
+            writeU16LE(baos, stats.getShort(base) & 0xffff)
+            writeU32LE(baos, 2)
+            writeU16LE(baos, stats.getShort(base + 1) & 0xffff)
           case org.apache.spark.sql.types.LongType =>
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base))
@@ -366,6 +372,16 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 4,
               s"PA-6.A IntegerType expects 4-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getInt)
+          case org.apache.spark.sql.types.ShortType =>
+            require(
+              lowerLen == 2,
+              s"PA-6.B ShortType expects 2-byte lowerBound, got $lowerLen")
+            row.update(base, buf.getShort)
+            val upperLen = buf.getInt
+            require(
+              upperLen == 2,
+              s"PA-6.B ShortType expects 2-byte upperBound, got $upperLen")
+            row.update(base + 1, buf.getShort)
           case org.apache.spark.sql.types.LongType =>
             require(
               lowerLen == 8,
@@ -388,6 +404,11 @@ object CachedColumnarBatchKryoSerializer {
       col += 1
     }
     row
+  }
+
+  private def writeU16LE(out: java.io.ByteArrayOutputStream, v: Int): Unit = {
+    out.write(v & 0xff)
+    out.write((v >>> 8) & 0xff)
   }
 
   private def writeU32LE(out: java.io.ByteArrayOutputStream, v: Int): Unit = {
