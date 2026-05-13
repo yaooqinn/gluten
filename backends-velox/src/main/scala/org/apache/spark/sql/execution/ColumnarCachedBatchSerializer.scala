@@ -104,16 +104,15 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
 
   override def write(kryo: Kryo, output: Output, batch: CachedColumnarBatch): Unit = {
     output.writeBytes(CachedColumnarBatchKryoSerializer.V3_MAGIC)
-    // Kryo fixed 4-byte BE (single-arg overload). Avoid (int, boolean) overload
-    // which silently forwards to writeVarInt (1-5 bytes) and breaks the magic
-    // sniff invariant.
+    // Use the single-arg writeInt(int) overload: fixed 4-byte BE. The (int, boolean) overload
+    // silently forwards to writeVarInt and would break magic-prefix sniffing on read.
     output.writeInt(batch.numRows)
     output.writeLong(batch.sizeInBytes)
     require(
       batch.bytes != null,
       "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
         s"serialize using ${this.getClass.getName}")
-    output.writeInt(batch.bytes.length + 1) // +1 to distinguish Kryo.NULL
+    output.writeInt(batch.bytes.length + 1) // +1 distinguishes Kryo.NULL
     output.writeBytes(batch.bytes)
     if (batch.stats == null) {
       output.writeBoolean(false)
@@ -123,15 +122,11 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       output.writeInt(statsBytes.length)
       output.writeBytes(statsBytes)
     }
-    // PA-6.0: schema for full-type dispatch (D-A5). Nullable: hasStats=false
-    // batches still write hasSchema=false. v3 layout uses an explicit boolean
-    // tag so reader can skip the JSON segment when schema is absent.
     if (batch.schema == null) {
       output.writeBoolean(false)
     } else {
       output.writeBoolean(true)
-      val schemaJson = batch.schema.json
-      val schemaBytes = schemaJson.getBytes(UTF_8)
+      val schemaBytes = batch.schema.json.getBytes(UTF_8)
       output.writeInt(schemaBytes.length)
       output.writeBytes(schemaBytes)
     }
@@ -146,9 +141,6 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V3_MAGIC)) {
       readV3(input)
     } else if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
-      // PA-6.5 D1: V2 readers (no schema tail) preserved for rolling-deploy
-      // compatibility. Old executor stream still parsable; schema=null path
-      // falls back to legacy BIGINT-only behavior in deserializeStats.
       readV2NoSchema(input)
     } else {
       readV1(input, first4)
@@ -166,51 +158,36 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
     val hasStats = input.readBoolean()
-    // PA-6.0: read schema first when present so deserializeStats can dispatch
-    // by dataType. v3 layout: hasStats then statsBytes (if any) then hasSchema
-    // then schemaJsonBytes (if any). Order MUST match writer above.
-    // NOTE: avoid `val (a: T, b: U) = ...` tuple destructuring with type
-    // ascription -- Scala 2.13 erases the Tuple2 generics and a typed-pattern
-    // match against `Tuple2` throws MatchError at runtime.
+    // Read schema *with* stats so deserializeStats can dispatch by dataType. Even when
+    // hasStats=false we must consume the hasSchema tag to keep the stream aligned.
+    // NB: avoid `val (a: T, b: U) = ...` -- Scala 2.13 erases Tuple2 generics and the typed
+    // pattern match throws MatchError at runtime.
     val statsAndSchema: (InternalRow, StructType) = if (hasStats) {
       val statsLen = input.readInt()
       val statsBytes = new Array[Byte](statsLen)
       input.readBytes(statsBytes)
-      val hasSchema = input.readBoolean()
-      val sch = if (hasSchema) {
-        val schemaLen = input.readInt()
-        val schemaBytes = new Array[Byte](schemaLen)
-        input.readBytes(schemaBytes)
-        DataType
-          .fromJson(new String(schemaBytes, UTF_8))
-          .asInstanceOf[StructType]
-      } else {
-        null
-      }
+      val sch = readOptionalSchema(input)
       (CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes, sch), sch)
     } else {
-      // Even with stats=null we must consume the hasSchema tag to keep the
-      // stream aligned for any subsequent batches in the same Kryo session.
-      val hasSchema = input.readBoolean()
-      val sch = if (hasSchema) {
-        val schemaLen = input.readInt()
-        val schemaBytes = new Array[Byte](schemaLen)
-        input.readBytes(schemaBytes)
-        DataType
-          .fromJson(new String(schemaBytes, UTF_8))
-          .asInstanceOf[StructType]
-      } else {
-        null
-      }
-      (null, sch)
+      (null, readOptionalSchema(input))
     }
     CachedColumnarBatch(numRows, sizeInBytes, bytes, statsAndSchema._1, statsAndSchema._2)
   }
 
-  // PA-6.5 D1: pre-PA-6.0 V2 layout (no schema tail). Reads stats with
-  // schema=null so deserializeStats falls back to BIGINT-only legacy path.
-  // Maintained for rolling-deploy compat - old executors writing V2 must
-  // still be readable by new executors.
+  private def readOptionalSchema(input: Input): StructType = {
+    if (!input.readBoolean()) {
+      null
+    } else {
+      val schemaLen = input.readInt()
+      val schemaBytes = new Array[Byte](schemaLen)
+      input.readBytes(schemaBytes)
+      DataType.fromJson(new String(schemaBytes, UTF_8)).asInstanceOf[StructType]
+    }
+  }
+
+  // Pre-V3 layout (no schema tail). Kept readable for rolling-deploy compat: V2-emitted batches
+  // from older executors must still deserialize. schema=null forces the legacy BIGINT-only path
+  // in deserializeStats.
   private def readV2NoSchema(input: Input): CachedColumnarBatch = {
     val numRows = input.readInt()
     val sizeInBytes = input.readLong()
@@ -231,8 +208,8 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     CachedColumnarBatch(numRows, sizeInBytes, bytes, stats, schema = null)
   }
 
+  // Legacy V1 layout: no magic, no stats. first4 is numRows in Kryo fixed 4-byte BE.
   private def readV1(input: Input, first4: Array[Byte]): CachedColumnarBatch = {
-    // first4 contains numRows in Kryo fixed 4-byte BE (legacy layout pre-PA-1).
     val numRows =
       ((first4(0) & 0xff) << 24) |
         ((first4(1) & 0xff) << 16) |
@@ -246,9 +223,6 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
         s"deserialize using ${this.getClass.getName}")
     val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
-    // stats=null -> buildFilter override falls back to pass-through (graceful degrade).
-    // PA-6.0: v1 has no schema either, pass null schema; CachedColumnarBatch.schema
-    // defaults to null so this remains source-compatible.
     CachedColumnarBatch(numRows, sizeInBytes, bytes, stats = null, schema = null)
   }
 }
