@@ -833,15 +833,11 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
     }
   }
 
-  // PA-3.1 GREEN: lazy-split iterator wrapper. stats=null batches (v1 binary
-  // read path, or PA-4 SQLConf-off write path) are directed through unchanged
-  // (skipping vanilla partition pruning); stats!=null batches are fed to the
-  // inherited parent buildFilter. Without this guard, parent's
-  // partitionFilter.eval(stats=null) NPEs on non-trivial predicates -- see
-  // todos/features/gluten-inmemory-cache-stats/investigations/0003-...md rev 2
-  // evidence 3 (both codegen and interpreted paths NPE, no fallback). A naive
-  // occupier-row placeholder fails differently (silent drop, evidence 3.A);
-  // only this lazy-split wrapper preserves correctness.
+  // Lazy-split iterator wrapper. stats=null batches are passed through unchanged; stats!=null
+  // batches are routed to the inherited parent buildFilter for partition pruning. Without this
+  // split, vanilla SimpleMetricsCachedBatchSerializer.buildFilter NPEs on
+  // partitionFilter.eval(null) for non-trivial predicates -- the codegen and interpreted
+  // paths both have no fallback for null stats.
   override def buildFilter(
       predicates: Seq[Expression],
       cachedAttributes: Seq[Attribute])
@@ -849,54 +845,40 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
     val parent = super.buildFilter(predicates, cachedAttributes)
     (index, cachedBatchIterator) =>
       new Iterator[CachedBatch] {
-        // Buffered so we can peek stats without consuming.
         private val peekable = cachedBatchIterator.buffered
-        // When the head is stats != null, drain a contiguous run through
-        // parent and buffer it here so hasNext can answer accurately.
         private var staged: Iterator[CachedBatch] = Iterator.empty
 
-        // Advance until either staged has an element ready, or peekable is
-        // drained. Called from hasNext so it is idempotent and safe to call
-        // even after the iterator is exhausted.
+        // Drain peekable until staged has an element ready, or peekable is empty. Idempotent:
+        // safe to call from both hasNext and next.
         private def advance(): Unit = {
           while (!staged.hasNext && peekable.hasNext) {
-            val head = peekable.head
-            val stats = head match {
-              case ccb: CachedColumnarBatch => ccb.stats
-              case smcb: SimpleMetricsCachedBatch => smcb.stats
-              case _ => null
-            }
+            val stats = statsOf(peekable.head)
             if (stats == null) {
-              // Pass through: load the staged buffer with this single batch
-              // (do NOT feed to parent, which would NPE on null stats).
+              // Pass through: do NOT feed to parent, which would NPE on null stats.
               staged = Iterator.single(peekable.next())
             } else {
-              // Drain contiguous run of stats!=null batches and route through
-              // parent. Lazy: only takes batches as parent's returned iterator
-              // pulls. We give parent a self-terminating sub-iterator.
+              // Feed parent a self-terminating sub-iterator covering the contiguous run of
+              // stats!=null batches; loop afterwards in case parent prunes everything in the run.
               val runIt = new Iterator[CachedBatch] {
-                override def hasNext: Boolean = peekable.hasNext && {
-                  val s = peekable.head match {
-                    case ccb: CachedColumnarBatch => ccb.stats
-                    case smcb: SimpleMetricsCachedBatch => smcb.stats
-                    case _ => null
-                  }
-                  s != null
-                }
+                override def hasNext: Boolean =
+                  peekable.hasNext && statsOf(peekable.head) != null
                 override def next(): CachedBatch = peekable.next()
               }
               staged = parent(index, runIt)
-              // If parent pruned every batch in the run, loop and check
-              // peekable again -- next batch may be stats=null pass-through.
             }
           }
+        }
+
+        private def statsOf(batch: CachedBatch): InternalRow = batch match {
+          case ccb: CachedColumnarBatch => ccb.stats
+          case smcb: SimpleMetricsCachedBatch => smcb.stats
+          case _ => null
         }
 
         override def hasNext: Boolean = {
           advance()
           staged.hasNext
         }
-
         override def next(): CachedBatch = {
           advance()
           staged.next()
