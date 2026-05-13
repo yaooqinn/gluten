@@ -28,15 +28,15 @@ import java.util.Locale
  * serializeStats, then exercises parseFramedBytes round-trip + corrupt-magic / truncated-blob
  * guards.
  *
- * Layout: `[ V2_MAGIC: 4B 0xFE 0xCA 0x53 0x02 ] [ statsLen: u32 LE ] [ statsBlob ] [ bytesLen: u32
- * LE ] [ bytesBlob ]`.
+ * Layout: `[ STATS_FRAMED_MAGIC: 4B 0xFE 0xCA 0x53 0x02 ] [ statsLen: u32 LE ] [ statsBlob ] [
+ * bytesLen: u32 LE ] [ bytesBlob ]`.
  */
 class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
 
   private def craftFramed(stats: InternalRow, bytesBlob: Array[Byte]): Array[Byte] = {
     val statsBlob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
     val out = new java.io.ByteArrayOutputStream()
-    out.write(CachedColumnarBatchKryoSerializer.V2_MAGIC)
+    out.write(CachedColumnarBatchKryoSerializer.STATS_FRAMED_MAGIC)
     writeU32LE(out, statsBlob.length)
     out.write(statsBlob)
     writeU32LE(out, bytesBlob.length)

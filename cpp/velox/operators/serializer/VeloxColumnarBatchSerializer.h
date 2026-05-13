@@ -57,9 +57,9 @@ class VeloxColumnarBatchSerializer : public ColumnarBatchSerializer {
   // false so the JVM side falls back to pass-through in buildFilter.
   std::vector<ColumnStats> computeStats(facebook::velox::RowVectorPtr rowVector);
 
-  // Returns framed bytes: [V2_MAGIC: 4B] [statsLen: u32 LE] [statsBlob] [bytesLen: u32 LE]
+  // Returns framed bytes: [STATS_FRAMED_MAGIC: 4B] [statsLen: u32 LE] [statsBlob] [bytesLen: u32 LE]
   // [bytesBlob]. statsBlob layout matches the JVM-side reader (CachedColumnarBatchKryoSerializer
-  // .deserializeStats). Magic 0xFE 0xCA 0x53 0x02 aligns with the JVM Kryo V2_MAGIC.
+  // .deserializeStats). Magic 0xFE 0xCA 0x53 0x02 aligns with the JVM Kryo STATS_FRAMED_MAGIC.
   std::vector<uint8_t> framedSerializeWithStats(const std::shared_ptr<ColumnarBatch>& batch) override;
 
  protected:

@@ -79,33 +79,23 @@ case class CachedColumnarBatch(
   extends SimpleMetricsCachedBatch
 
 /**
- * Kryo serializer for [[CachedColumnarBatch]] with magic-prefix versioning.
+ * Kryo serializer for [[CachedColumnarBatch]].
  *
- * V3 layout (current, schema-bearing):
+ * Wire layout:
  * {{{
- *   [V3_MAGIC: 0xFE 0xCA 0x53 0x03]
- *   [numRows: Int]                  // Kryo fixed 4-byte BE (single-arg writeInt)
+ *   [numRows: Int]                  // single-arg writeInt = fixed 4-byte BE
  *   [sizeInBytes: Long]
  *   [bytes.length + 1: Int]         // +1 distinguishes Kryo.NULL
  *   [bytes]
  *   [hasStats: Boolean]  if true: [statsLen: Int] [statsBlob]
  *   [hasSchema: Boolean] if true: [schemaLen: Int] [schemaJsonBytes]
  * }}}
- *
- * V2 layout (no schema tail) and V1 layout (no magic, no stats) are still readable for
- * rolling-deploy / cross-version compat. V2-read passes `schema=null` so deserializeStats falls
- * back to the legacy BIGINT-only path; V1-read produces `stats=null`.
- *
- * Magic disjointness from V1: a V1 stream's first 4 bytes are `numRows` (Kryo fixed 4-byte BE); any
- * non-negative Int < 2^31 has high byte in [0x00, 0x7F], so the magic's high byte 0xFE > 0x7F is
- * structurally unreachable.
  */
 class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBatch] {
 
   override def write(kryo: Kryo, output: Output, batch: CachedColumnarBatch): Unit = {
-    output.writeBytes(CachedColumnarBatchKryoSerializer.V3_MAGIC)
     // Use the single-arg writeInt(int) overload: fixed 4-byte BE. The (int, boolean) overload
-    // silently forwards to writeVarInt and would break magic-prefix sniffing on read.
+    // silently forwards to writeVarInt (1-5 bytes) and would corrupt the read path.
     output.writeInt(batch.numRows)
     output.writeLong(batch.sizeInBytes)
     require(
@@ -136,18 +126,6 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       kryo: Kryo,
       input: Input,
       cls: Class[CachedColumnarBatch]): CachedColumnarBatch = {
-    val first4 = new Array[Byte](4)
-    input.readBytes(first4)
-    if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V3_MAGIC)) {
-      readV3(input)
-    } else if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
-      readV2NoSchema(input)
-    } else {
-      readV1(input, first4)
-    }
-  }
-
-  private def readV3(input: Input): CachedColumnarBatch = {
     val numRows = input.readInt()
     val sizeInBytes = input.readLong()
     val length = input.readInt()
@@ -158,8 +136,7 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
     val hasStats = input.readBoolean()
-    // Read schema *with* stats so deserializeStats can dispatch by dataType. Even when
-    // hasStats=false we must consume the hasSchema tag to keep the stream aligned.
+    // Even when hasStats=false we still consume the hasSchema tag to keep the stream aligned.
     // NB: avoid `val (a: T, b: U) = ...` -- Scala 2.13 erases Tuple2 generics and the typed
     // pattern match throws MatchError at runtime.
     val statsAndSchema: (InternalRow, StructType) = if (hasStats) {
@@ -184,57 +161,14 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       DataType.fromJson(new String(schemaBytes, UTF_8)).asInstanceOf[StructType]
     }
   }
-
-  // Pre-V3 layout (no schema tail). Kept readable for rolling-deploy compat: V2-emitted batches
-  // from older executors must still deserialize. schema=null forces the legacy BIGINT-only path
-  // in deserializeStats.
-  private def readV2NoSchema(input: Input): CachedColumnarBatch = {
-    val numRows = input.readInt()
-    val sizeInBytes = input.readLong()
-    val length = input.readInt()
-    require(
-      length != Kryo.NULL,
-      "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
-        s"deserialize using ${this.getClass.getName}")
-    val bytes = new Array[Byte](length - 1)
-    input.readBytes(bytes)
-    val hasStats = input.readBoolean()
-    val stats: InternalRow = if (hasStats) {
-      val statsLen = input.readInt()
-      val statsBytes = new Array[Byte](statsLen)
-      input.readBytes(statsBytes)
-      CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes, null)
-    } else null
-    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats, schema = null)
-  }
-
-  // Legacy V1 layout: no magic, no stats. first4 is numRows in Kryo fixed 4-byte BE.
-  private def readV1(input: Input, first4: Array[Byte]): CachedColumnarBatch = {
-    val numRows =
-      ((first4(0) & 0xff) << 24) |
-        ((first4(1) & 0xff) << 16) |
-        ((first4(2) & 0xff) << 8) |
-        (first4(3) & 0xff)
-    val sizeInBytes = input.readLong()
-    val length = input.readInt()
-    require(
-      length != Kryo.NULL,
-      "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
-        s"deserialize using ${this.getClass.getName}")
-    val bytes = new Array[Byte](length - 1)
-    input.readBytes(bytes)
-    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats = null, schema = null)
-  }
 }
 
 object CachedColumnarBatchKryoSerializer {
-  // Magic bytes are chosen so the high byte (0xFE) cannot collide with V1's first byte:
-  // V1 starts with numRows as Kryo fixed 4-byte BE, whose high byte is in [0x00, 0x7F] for any
-  // non-negative Int < 2^31.
-  val V2_MAGIC: Array[Byte] =
+  // Sanity-check magic for the cpp/JVM ABI of the framed JNI return (serializeWithStats). Not a
+  // version tag: a corrupt or truncated cpp emit fails fast here instead of feeding garbage into
+  // length-prefix readers downstream.
+  val STATS_FRAMED_MAGIC: Array[Byte] =
     Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x02.toByte)
-  val V3_MAGIC: Array[Byte] =
-    Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x03.toByte)
 
   // Per-column statsBlob layout (LE throughout, matches the cpp emitter in
   // VeloxColumnarBatchSerializer.cc):
@@ -582,8 +516,8 @@ object CachedColumnarBatchKryoSerializer {
   /**
    * Parse the JNI `serializeWithStats` framed return into (stats InternalRow, bytesBlob).
    *
-   * Framed layout (matches cpp VeloxColumnarBatchSerializer.cc):
-   * `[ V2_MAGIC: 4B ] [ statsLen: u32 LE ] [ statsBlob ] [ bytesLen: u32 LE ] [ bytesBlob ]`.
+   * Framed layout (matches cpp VeloxColumnarBatchSerializer.cc): `[ STATS_FRAMED_MAGIC: 4B ] [
+   * statsLen: u32 LE ] [ statsBlob ] [ bytesLen: u32 LE ] [ bytesBlob ]`.
    *
    * Eager guards catch corrupt magic / truncated framing before they propagate.
    */
@@ -594,11 +528,11 @@ object CachedColumnarBatchKryoSerializer {
       framed != null && framed.length >= 4 + 4 + 4,
       s"framed bytes too short: len=${if (framed == null) -1 else framed.length}")
     require(
-      framed(0) == V2_MAGIC(0) && framed(1) == V2_MAGIC(1) &&
-        framed(2) == V2_MAGIC(2) && framed(3) == V2_MAGIC(3),
+      framed(0) == STATS_FRAMED_MAGIC(0) && framed(1) == STATS_FRAMED_MAGIC(1) &&
+        framed(2) == STATS_FRAMED_MAGIC(2) && framed(3) == STATS_FRAMED_MAGIC(3),
       f"framed bytes magic mismatch: expected " +
-        f"0x${V2_MAGIC(0) & 0xff}%02X${V2_MAGIC(1) & 0xff}%02X" +
-        f"${V2_MAGIC(2) & 0xff}%02X${V2_MAGIC(3) & 0xff}%02X, got " +
+        f"0x${STATS_FRAMED_MAGIC(0) & 0xff}%02X${STATS_FRAMED_MAGIC(1) & 0xff}%02X" +
+        f"${STATS_FRAMED_MAGIC(2) & 0xff}%02X${STATS_FRAMED_MAGIC(3) & 0xff}%02X, got " +
         f"0x${framed(0) & 0xff}%02X${framed(1) & 0xff}%02X" +
         f"${framed(2) & 0xff}%02X${framed(3) & 0xff}%02X"
     )
