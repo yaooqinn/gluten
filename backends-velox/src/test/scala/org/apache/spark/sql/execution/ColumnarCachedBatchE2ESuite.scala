@@ -233,4 +233,45 @@ class ColumnarCachedBatchE2ESuite
       cached.unpersist()
     }
   }
+
+  // PA-6.5 B1 regression: multi-column cache must not crash with
+  // IndexOutOfBoundsException. Pre-fix `schema(base)` (base=col*5) threw
+  // for any col>=1. This asserts both no-crash and correct-result on a
+  // 3-column LongType cache.
+  test("PA-6.5 B1 multi-column cache: no IndexOOB + correct result") {
+    val cached = spark
+      .range(N)
+      .selectExpr(
+        "cast(id as bigint) as a",
+        "cast(id * 2 as bigint) as b",
+        "cast(id + 100 as bigint) as c")
+      .repartitionByRange(P, col("a"))
+      .cache()
+    try {
+      cached.count()
+      val result = cached.filter(col("a") === pivot && col("c") === (pivot + 100L)).count()
+      assert(result == 1L, s"expected 1 row matching pivot, got $result")
+    } finally {
+      cached.unpersist()
+    }
+  }
+
+  // PA-6.5 B2 regression: short-Decimal source column must not crash
+  // (Velox emits supported=1 as BIGINT physical; JVM-side allowlist
+  // demotes to supported=0 until PA-7 marshal lands).
+  test("PA-6.5 B2 Decimal column cache: no UOE crash on materialize + read") {
+    val cached = spark
+      .range(N)
+      .selectExpr("cast(id as decimal(10, 2)) as d")
+      .repartition(P)
+      .cache()
+    try {
+      cached.count() // must NOT throw UnsupportedOperationException (cpp emits BIGINT-physical)
+      // Read-back must also not crash on deserializeStats `case other` path.
+      val total = cached.count()
+      assert(total == N, s"expected $N rows, got $total")
+    } finally {
+      cached.unpersist()
+    }
+  }
 }

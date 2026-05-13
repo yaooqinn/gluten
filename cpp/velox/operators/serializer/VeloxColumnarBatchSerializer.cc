@@ -213,18 +213,8 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
-      case TypeKind::HUGEINT: {
-        auto* flat = child->asFlatVector<int128_t>();
-        int128_t lo = 0, hi = 0;
-        supported = scanMinMax<int128_t>(flat, lo, hi, nullCnt, seen);
-        if (supported && seen) {
-          stats.hasLowerBound = true;
-          stats.hasUpperBound = true;
-          stats.lowerBound = variant(lo);
-          stats.upperBound = variant(hi);
-        }
-        break;
-      }
+      // B4 (PA-6.5): HUGEINT dropped — emit_gate excludes it; defer to PA-8.
+      // case TypeKind::HUGEINT: ...
       default:
         // Other types deferred to later micro-slices (Integer / Double / String /
         // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
@@ -278,7 +268,7 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::TINYINT);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
-    pushU32(numRows);  // count = rowVector->size()
+    pushU32(numRows - static_cast<uint32_t>(s.nullCount));  // B3: count = non-null per vanilla PartitionStatistics
     pushU64(0);        // sizeInBytes placeholder (PA-2.5b)
     if (emitSupported) {
       switch (kind) {

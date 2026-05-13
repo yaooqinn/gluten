@@ -121,7 +121,7 @@ case class CachedColumnarBatch(
 class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBatch] {
 
   override def write(kryo: Kryo, output: Output, batch: CachedColumnarBatch): Unit = {
-    output.writeBytes(CachedColumnarBatchKryoSerializer.V2_MAGIC)
+    output.writeBytes(CachedColumnarBatchKryoSerializer.V3_MAGIC)
     // Kryo fixed 4-byte BE (single-arg overload). Avoid (int, boolean) overload
     // which silently forwards to writeVarInt (1-5 bytes) and breaks the magic
     // sniff invariant.
@@ -161,14 +161,19 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       cls: Class[CachedColumnarBatch]): CachedColumnarBatch = {
     val first4 = new Array[Byte](4)
     input.readBytes(first4)
-    if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
-      readV2(input)
+    if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V3_MAGIC)) {
+      readV3(input)
+    } else if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
+      // PA-6.5 D1: V2 readers (no schema tail) preserved for rolling-deploy
+      // compatibility. Old executor stream still parsable; schema=null path
+      // falls back to legacy BIGINT-only behavior in deserializeStats.
+      readV2NoSchema(input)
     } else {
       readV1(input, first4)
     }
   }
 
-  private def readV2(input: Input): CachedColumnarBatch = {
+  private def readV3(input: Input): CachedColumnarBatch = {
     val numRows = input.readInt()
     val sizeInBytes = input.readLong()
     val length = input.readInt()
@@ -220,6 +225,30 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     CachedColumnarBatch(numRows, sizeInBytes, bytes, statsAndSchema._1, statsAndSchema._2)
   }
 
+  // PA-6.5 D1: pre-PA-6.0 V2 layout (no schema tail). Reads stats with
+  // schema=null so deserializeStats falls back to BIGINT-only legacy path.
+  // Maintained for rolling-deploy compat - old executors writing V2 must
+  // still be readable by new executors.
+  private def readV2NoSchema(input: Input): CachedColumnarBatch = {
+    val numRows = input.readInt()
+    val sizeInBytes = input.readLong()
+    val length = input.readInt()
+    require(
+      length != Kryo.NULL,
+      "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
+        s"deserialize using ${this.getClass.getName}")
+    val bytes = new Array[Byte](length - 1)
+    input.readBytes(bytes)
+    val hasStats = input.readBoolean()
+    val stats: InternalRow = if (hasStats) {
+      val statsLen = input.readInt()
+      val statsBytes = new Array[Byte](statsLen)
+      input.readBytes(statsBytes)
+      CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes, null)
+    } else null
+    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats, schema = null)
+  }
+
   private def readV1(input: Input, first4: Array[Byte]): CachedColumnarBatch = {
     // first4 contains numRows in Kryo fixed 4-byte BE (legacy layout pre-PA-1).
     val numRows =
@@ -249,6 +278,10 @@ object CachedColumnarBatchKryoSerializer {
   // structurally unreachable, so any v1 first byte is <= 0x7F < 0xFE -- disjoint.
   val V2_MAGIC: Array[Byte] =
     Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x02.toByte)
+  // PA-6.5 D1: V3_MAGIC distinguishes the schema-tail-bearing layout from
+  // pre-PA-6.0 V2. Same disjointness from V1 (high byte 0xFE > 0x7F).
+  val V3_MAGIC: Array[Byte] =
+    Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x03.toByte)
 
   // PA-3.2: statsBlob binary framing, aligned with cpp end
   // (cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5b
@@ -273,6 +306,26 @@ object CachedColumnarBatchKryoSerializer {
   // sec 3 + investigations/0003 rev 2 evidence 2. PA-1 placeholder used 2
   // slots; PA-3.2 + test update align with vanilla.
   //
+  // PA-6.5 B2: dataType allowlist for dispatch table. Source columns whose
+  // dataType is NOT in this set are demoted to supported=0 in serializeStats,
+  // preventing cpp-emitted stats (e.g. short-Decimal as Velox BIGINT) from
+  // causing UnsupportedOperationException in JVM dispatch. Decimal/String/
+  // Bool/Float/Double/Timestamp/TimestampNTZ land in PA-7..PA-10.
+  private[execution] def isDispatchable(dt: org.apache.spark.sql.types.DataType): Boolean =
+    dt match {
+      case org.apache.spark.sql.types.IntegerType
+          | org.apache.spark.sql.types.DateType
+          | _: org.apache.spark.sql.types.YearMonthIntervalType => true
+      case org.apache.spark.sql.types.ShortType => true
+      case org.apache.spark.sql.types.ByteType => true
+      case org.apache.spark.sql.types.LongType
+          | _: org.apache.spark.sql.types.DayTimeIntervalType
+          | org.apache.spark.sql.types.TimestampType
+          | org.apache.spark.sql.types.TimestampNTZType => true
+      case _ => false
+    }
+
+  //
   // PA-6.0: schema parameter added for full-type dispatch (D-A5). PA-6.0 itself
   // remains BIGINT-only behavior (schema is unused inside); PA-6.A onwards adds
   // per-column dataType dispatch reading the schema. schema may be null for
@@ -294,7 +347,13 @@ object CachedColumnarBatchKryoSerializer {
       val base = col * 5
       val hasLower = !stats.isNullAt(base)
       val hasUpper = !stats.isNullAt(base + 1)
-      val supported = hasLower && hasUpper
+      // PA-6.5 B2: demote to unsupported for any dataType not yet in dispatch table
+      // (Decimal/String/Bool/Float/Double/Timestamp deferred to PA-7..PA-10). cpp may
+      // still emit supported=1 for short-Decimal (Velox physical=BIGINT); JVM-side
+      // gate prevents UOE crash.
+      val dispatchable = (schema == null) ||
+        CachedColumnarBatchKryoSerializer.isDispatchable(schema(col).dataType)
+      val supported = hasLower && hasUpper && dispatchable
       baos.write(if (supported) 1 else 0)
       writeU32LE(baos, if (stats.isNullAt(base + 2)) 0 else stats.getInt(base + 2))
       writeU32LE(baos, if (stats.isNullAt(base + 3)) 0 else stats.getInt(base + 3))
@@ -306,7 +365,7 @@ object CachedColumnarBatchKryoSerializer {
         // column dataType (see ~/spark/.../ColumnStats.scala line 25-32).
         // schema==null => legacy BIGINT-only behavior (PA-3.2).
         val dt: org.apache.spark.sql.types.DataType =
-          if (schema == null) org.apache.spark.sql.types.LongType else schema(base).dataType
+          if (schema == null) org.apache.spark.sql.types.LongType else schema(col).dataType
         dt match {
           case org.apache.spark.sql.types.IntegerType
               | org.apache.spark.sql.types.DateType
@@ -380,7 +439,7 @@ object CachedColumnarBatchKryoSerializer {
         // BIGINT-only (PA-3.2). lowerLen on the wire still authoritative for
         // payload width; we cross-check against schema dispatch.
         val dt: org.apache.spark.sql.types.DataType =
-          if (schema == null) org.apache.spark.sql.types.LongType else schema(base).dataType
+          if (schema == null) org.apache.spark.sql.types.LongType else schema(col).dataType
         val lowerLen = buf.getInt
         dt match {
           case org.apache.spark.sql.types.IntegerType
@@ -429,9 +488,17 @@ object CachedColumnarBatchKryoSerializer {
               s"PA-3.2/E/G Long-family expects 8-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getLong)
           case other =>
-            throw new UnsupportedOperationException(
-              s"PA-6.A deserializeStats: dispatch for $other not implemented yet " +
-                "(landing in PA-6.B/C/F/G or PA-7..PA-10)")
+            // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
+            // BIGINT physical) or other types not yet in JVM dispatch.
+            // Skip payload (8B for BIGINT path) instead of crashing; mark
+            // as unsupported in the InternalRow (don't update lowerBound).
+            val lowerSkipLen = lowerLen
+            val lowerSkip = new Array[Byte](lowerSkipLen)
+            buf.get(lowerSkip)
+            val upperSkipLen = buf.getInt
+            val upperSkip = new Array[Byte](upperSkipLen)
+            buf.get(upperSkip)
+          // Caller treats null lowerBound/upperBound as supported=false.
         }
       }
       row.update(base + 2, nullCount)
@@ -505,9 +572,10 @@ object CachedColumnarBatchKryoSerializer {
     val stats = deserializeStats(statsBlob, schema)
     val bytesLen = buf.getInt
     require(
-      bytesLen >= 0 && bytesLen <= buf.remaining(),
-      s"framed bytes bytesLen=$bytesLen exceeds remaining buffer " +
-        s"${buf.remaining()} (truncated?)")
+      bytesLen >= 0 && bytesLen == buf.remaining(),
+      s"framed bytes bytesLen=$bytesLen != remaining buffer " +
+        s"${buf.remaining()} (truncated or trailing garbage). PA-6.5 H1 strict check."
+    )
     val bytesBlob = new Array[Byte](bytesLen)
     buf.get(bytesBlob)
     (stats, bytesBlob)
