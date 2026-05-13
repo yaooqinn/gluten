@@ -23,6 +23,8 @@ import org.apache.spark.unsafe.types.UTF8String
 
 import org.scalatest.funsuite.AnyFunSuite
 
+import java.util.Arrays
+
 /**
  * Ship-blocker acceptance tests for the non-BIGINT marshal paths (Decimal short/long, String, Float
  * / Double NaN guard). Guards against silent corruption (wrong Decimal scale, wrong UTF-8 byte
@@ -93,11 +95,11 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
   // After truncate, decoded upper must compare byte-wise >= the original.
   test("PA-9 String truncation to 256B widens upper bound monotonically") {
     val loBytes = new Array[Byte](100)
-    java.util.Arrays.fill(loBytes, 'a'.toByte)
+    Arrays.fill(loBytes, 'a'.toByte)
     // Upper: 300 bytes of 'm' followed by trailing chars. Truncated prefix
     // is 256 'm's (all 0x6d); +1 carry on last byte -> last byte = 0x6e.
     val hiBytes = new Array[Byte](300)
-    java.util.Arrays.fill(hiBytes, 'm'.toByte)
+    Arrays.fill(hiBytes, 'm'.toByte)
     val lo = UTF8String.fromBytes(loBytes)
     val hi = UTF8String.fromBytes(hiBytes)
     val stats: InternalRow = new GenericInternalRow(Array[Any](lo, hi, 0, 100, 50000L))
@@ -124,9 +126,9 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
 
   test("PA-9 String carry overflow demotes column to unsupported") {
     val loBytes = new Array[Byte](10)
-    java.util.Arrays.fill(loBytes, 0xff.toByte)
+    Arrays.fill(loBytes, 0xff.toByte)
     val hiBytes = new Array[Byte](300)
-    java.util.Arrays.fill(hiBytes, 0xff.toByte)
+    Arrays.fill(hiBytes, 0xff.toByte)
     val lo = UTF8String.fromBytes(loBytes)
     val hi = UTF8String.fromBytes(hiBytes)
     val stats: InternalRow = new GenericInternalRow(Array[Any](lo, hi, 0, 100, 50000L))

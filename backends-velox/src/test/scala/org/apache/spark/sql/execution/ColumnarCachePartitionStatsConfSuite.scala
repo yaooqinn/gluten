@@ -20,6 +20,8 @@ import org.apache.gluten.config.GlutenConfig
 
 import org.apache.spark.SparkFunSuite
 
+import java.util.Locale
+
 /**
  * Verifies the partition-stats SQLConf key, default-off, and doc text. End-to-end branch behavior
  * (conf=true -> serializeWithStats, conf=false -> legacy serialize) is anchored by
@@ -35,11 +37,11 @@ class ColumnarCachePartitionStatsConfSuite extends SparkFunSuite {
   test("PA-4.B conf doc mentions default-off rationale") {
     val doc = GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED.doc
     assert(
-      doc.toLowerCase(java.util.Locale.ROOT).contains("default"),
+      doc.toLowerCase(Locale.ROOT).contains("default"),
       s"doc should mention default state: $doc")
     assert(
-      doc.toLowerCase(java.util.Locale.ROOT).contains("benchmark") ||
-        doc.toLowerCase(java.util.Locale.ROOT).contains("regression"),
+      doc.toLowerCase(Locale.ROOT).contains("benchmark") ||
+        doc.toLowerCase(Locale.ROOT).contains("regression"),
       s"doc should mention why default-off (bench / regression): $doc"
     )
   }

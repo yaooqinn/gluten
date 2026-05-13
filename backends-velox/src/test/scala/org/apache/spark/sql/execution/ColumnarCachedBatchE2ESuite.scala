@@ -20,9 +20,13 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution.VeloxWholeStageTransformerSuite
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.{InMemoryTableScanExec, SparkCacheUtil}
 import org.apache.spark.sql.functions.{col, lit, when}
+
+import java.sql.Timestamp
+import java.time.Instant
 
 /**
  * End-to-end smoke for Gluten in-memory cache stats (Layer A min/max).
@@ -62,7 +66,7 @@ class ColumnarCachedBatchE2ESuite
   private val P: Int = 5
   private val pivot: Long = 500L // falls inside partition that owns [400, 600)
 
-  private def cacheRange(): org.apache.spark.sql.DataFrame = {
+  private def cacheRange(): DataFrame = {
     spark
       .range(N)
       .select(col("id").cast("bigint").as("k"))
@@ -283,8 +287,7 @@ class ColumnarCachedBatchE2ESuite
       .cache()
     try {
       cached.count() // materialize -- triggers cpp TIMESTAMP computeStats path
-      val pivotTs = sparkLit(java.sql.Timestamp.from(
-        java.time.Instant.ofEpochSecond(baseSec + (N / 2))))
+      val pivotTs = sparkLit(Timestamp.from(Instant.ofEpochSecond(baseSec + (N / 2))))
       val df = cached.filter(col("ts") === pivotTs)
       val result = df.count()
       assert(result == 1L, s"expected exactly one row matching timestamp pivot, got $result")

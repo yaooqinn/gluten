@@ -21,6 +21,8 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 
 import org.scalatest.funsuite.AnyFunSuite
 
+import java.util.Locale
+
 /**
  * Tests for JNI `serializeWithStats` framed-byte parser. Pure JVM; crafts framed bytes by hand via
  * serializeStats, then exercises parseFramedBytes round-trip + corrupt-magic / truncated-blob
@@ -84,7 +86,7 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
       CachedColumnarBatchKryoSerializer.parseFramedBytes(bad, null)
     }
     assert(
-      ex.getMessage.toLowerCase(java.util.Locale.ROOT).contains("magic"),
+      ex.getMessage.toLowerCase(Locale.ROOT).contains("magic"),
       s"expected 'magic' in error, got: ${ex.getMessage}")
   }
 
