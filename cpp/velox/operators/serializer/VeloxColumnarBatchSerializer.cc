@@ -282,7 +282,11 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::HUGEINT);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
-    pushU32(numRows - static_cast<uint32_t>(s.nullCount));  // B3: count = non-null per vanilla PartitionStatistics
+    pushU32(numRows);  // PA-6.5 B3 (corrected post-Layer-2 #2): vanilla
+                       // PartitionStatistics.count = numRows (gatherNullStats
+                       // increments count too per ColumnStats.scala:65). Earlier
+                       // attempt subtracted nullCount, which inverted IsNotNull
+                       // predicate (count - nullCount > 0) into double-subtract.
     pushU64(0);        // sizeInBytes placeholder (PA-2.5b)
     if (emitSupported) {
       switch (kind) {

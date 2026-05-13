@@ -266,12 +266,36 @@ class ColumnarCachedBatchE2ESuite
       .repartition(P)
       .cache()
     try {
-      cached.count() // must NOT throw UnsupportedOperationException (cpp emits BIGINT-physical)
-      // Read-back must also not crash on deserializeStats `case other` path.
+      cached.count()
       val total = cached.count()
       assert(total == N, s"expected $N rows, got $total")
     } finally {
       cached.unpersist()
+    }
+  }
+
+  // PA-8.5 SB1 regression: IsNotNull predicate must NOT silently skip a
+  // partition just because it has nullCount > 0. Vanilla buildFilter
+  // computes (count - nullCount > 0) where count = numRows (vanilla
+  // gatherNullStats increments count on null rows too). If cpp emits
+  // count = numRows - nullCount instead, the predicate becomes
+  // (numRows - 2*nullCount > 0) and silently false-negatives partitions
+  // with nullCount > numRows/2.
+  test("PA-8.5 SB1 IsNotNull predicate honors vanilla count semantics") {
+    val df = spark
+      .range(N)
+      .selectExpr("if(id % 3 = 0, cast(null as bigint), id) as k") // ~33% nulls
+      .repartition(P)
+      .cache()
+    try {
+      df.count() // materialize
+      val nonNullCount = df.filter(col("k").isNotNull).count()
+      val expected = (0L until N).count(_ % 3 != 0).toLong
+      assert(
+        nonNullCount == expected,
+        s"IsNotNull silently dropped partitions: got $nonNullCount, expected $expected")
+    } finally {
+      df.unpersist()
     }
   }
 }
