@@ -213,8 +213,21 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
-      // B4 (PA-6.5): HUGEINT dropped — emit_gate excludes it; defer to PA-8.
-      // case TypeKind::HUGEINT: ...
+      case TypeKind::HUGEINT: {
+        // PA-8: restore HUGEINT scan for long-Decimal (precision > 18) marshal.
+        // (B4 in PA-6.5 dropped this when emit_gate excluded it; PA-8 wires it
+        // through with 16B LE.)
+        auto* flat = child->asFlatVector<int128_t>();
+        int128_t lo = 0, hi = 0;
+        supported = scanMinMax<int128_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
       default:
         // Other types deferred to later micro-slices (Integer / Double / String /
         // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
@@ -265,7 +278,8 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
         (kind == facebook::velox::TypeKind::BIGINT ||
          kind == facebook::velox::TypeKind::INTEGER ||
          kind == facebook::velox::TypeKind::SMALLINT ||
-         kind == facebook::velox::TypeKind::TINYINT);
+         kind == facebook::velox::TypeKind::TINYINT ||
+         kind == facebook::velox::TypeKind::HUGEINT);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     pushU32(numRows - static_cast<uint32_t>(s.nullCount));  // B3: count = non-null per vanilla PartitionStatistics
@@ -296,6 +310,23 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushU32(1);
           pushU8(static_cast<uint8_t>(s.upperBound.value<int8_t>()));
           break;
+        case facebook::velox::TypeKind::HUGEINT: {
+          // PA-8: 16 LE bytes. int128 split into low/high uint64 halves,
+          // little-endian wire order (low first). JVM reconstructs via
+          // BigInteger from signed two's-complement big-endian byte array
+          // (reverse on read).
+          auto pushI128LE = [&](int128_t v) {
+            uint64_t lo = static_cast<uint64_t>(v);
+            uint64_t hi = static_cast<uint64_t>(v >> 64);
+            pushU64(lo);
+            pushU64(hi);
+          };
+          pushU32(16);
+          pushI128LE(s.lowerBound.value<int128_t>());
+          pushU32(16);
+          pushI128LE(s.upperBound.value<int128_t>());
+          break;
+        }
         default:
           break;
       }

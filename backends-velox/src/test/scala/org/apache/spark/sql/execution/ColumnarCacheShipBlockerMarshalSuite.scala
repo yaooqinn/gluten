@@ -61,18 +61,18 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // PA-5.D ship blocker (NB3): Decimal(30, 5) -- precision > 18 uses
-  // BigInteger / Int128 backing (16 bytes). cpp end must marshal in matching
-  // byte order; JVM end must reconstruct correctly.
-  // Trigger: when cpp marshals Decimal min/max for precision > 18.
-  ignore("PA-5.D Decimal(30, 5) round-trip preserves big value (follow-up PR acceptance)") {
+  // PA-8 (was PA-5.D): Decimal(30, 5) -- precision > 18 uses BigInteger /
+  // int128 backing (16 bytes). cpp HUGEINT marshal to 16B LE; JVM
+  // reconstructs via signed BE BigInteger.
+  test("PA-8 Decimal(30, 5) round-trip preserves big value") {
     val big = BigDecimal("12345678901234567890.12345")
     val lo = Decimal(big.bigDecimal.negate(), 30, 5)
     val hi = Decimal(big, 30, 5)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 1600L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
+    val schema = StructType(Seq(StructField("d", DecimalType(30, 5))))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
     val dt = DecimalType(30, 5)
     val readLo = read.get(0, dt)
     val readHi = read.get(1, dt)

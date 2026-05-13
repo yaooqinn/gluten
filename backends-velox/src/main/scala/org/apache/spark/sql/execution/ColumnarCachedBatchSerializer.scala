@@ -325,6 +325,10 @@ object CachedColumnarBatchKryoSerializer {
       // PA-7: short-decimal (p<=18) uses Long unscaled backing; long-decimal
       // (p>18) lands in PA-8 with int128 path.
       case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 => true
+      // PA-8: long-decimal (p>18) uses BigInteger backing; marshal as 16B LE
+      // signed two's-complement. Velox short-vs-long boundary aligns at p=18
+      // (Spark) and physical TypeKind::HUGEINT.
+      case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 => true
       case _ => false
     }
 
@@ -416,6 +420,16 @@ object CachedColumnarBatchKryoSerializer {
             writeI64LE(baos, stats.getDecimal(base, d.precision, d.scale).toUnscaledLong)
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getDecimal(base + 1, d.precision, d.scale).toUnscaledLong)
+          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 =>
+            // PA-8: long-Decimal (p>18). Marshal 16B LE signed two's-complement
+            // unscaled BigInteger. Matches cpp HUGEINT int128 wire (low/high
+            // uint64 LE pair).
+            val loDec = stats.getDecimal(base, d.precision, d.scale)
+            val hiDec = stats.getDecimal(base + 1, d.precision, d.scale)
+            writeU32LE(baos, 16)
+            writeI128LE(baos, loDec.toJavaBigDecimal.unscaledValue)
+            writeU32LE(baos, 16)
+            writeI128LE(baos, hiDec.toJavaBigDecimal.unscaledValue)
           case other =>
             throw new UnsupportedOperationException(
               s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
@@ -513,6 +527,32 @@ object CachedColumnarBatchKryoSerializer {
             row.update(
               base + 1,
               org.apache.spark.sql.types.Decimal(buf.getLong, d.precision, d.scale))
+          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 =>
+            // PA-8: read 16B LE signed two's-complement, reconstruct
+            // Decimal(BigDecimal(unscaled BigInteger, scale), p, s).
+            require(
+              lowerLen == 16,
+              s"PA-8 long-Decimal expects 16-byte lowerBound, got $lowerLen")
+            val loBytes = new Array[Byte](16)
+            buf.get(loBytes)
+            row.update(
+              base,
+              org.apache.spark.sql.types.Decimal(
+                new java.math.BigDecimal(readI128LE(loBytes), d.scale),
+                d.precision,
+                d.scale))
+            val upperLenL = buf.getInt
+            require(
+              upperLenL == 16,
+              s"PA-8 long-Decimal expects 16-byte upperBound, got $upperLenL")
+            val hiBytes = new Array[Byte](16)
+            buf.get(hiBytes)
+            row.update(
+              base + 1,
+              org.apache.spark.sql.types.Decimal(
+                new java.math.BigDecimal(readI128LE(hiBytes), d.scale),
+                d.precision,
+                d.scale))
           case other =>
             // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
             // BIGINT physical) or other types not yet in JVM dispatch.
@@ -557,6 +597,43 @@ object CachedColumnarBatchKryoSerializer {
 
   private def writeI64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit =
     writeU64LE(out, v)
+
+  // PA-8: write 16B LE signed two's-complement representation of a BigInteger.
+  // BigInteger.toByteArray() returns big-endian signed bytes (minimal width);
+  // sign-extend to 16 and reverse. Throws if value doesn't fit in int128.
+  private def writeI128LE(out: java.io.ByteArrayOutputStream, v: java.math.BigInteger): Unit = {
+    val raw = v.toByteArray // BE signed two's-complement
+    require(raw.length <= 16, s"PA-8 BigInteger does not fit int128 (${raw.length} bytes)")
+    val padded = new Array[Byte](16)
+    val signByte: Byte = if (v.signum < 0) 0xff.toByte else 0x00.toByte
+    var i = 0
+    while (i < 16 - raw.length) {
+      padded(i) = signByte
+      i += 1
+    }
+    System.arraycopy(raw, 0, padded, 16 - raw.length, raw.length)
+    // reverse to LE
+    var j = 0
+    while (j < 8) {
+      val t = padded(j)
+      padded(j) = padded(15 - j)
+      padded(15 - j) = t
+      j += 1
+    }
+    out.write(padded)
+  }
+
+  // PA-8: read 16B LE signed two's-complement back into BigInteger.
+  private def readI128LE(le: Array[Byte]): java.math.BigInteger = {
+    require(le.length == 16, s"PA-8 readI128LE expects 16 bytes, got ${le.length}")
+    val be = new Array[Byte](16)
+    var i = 0
+    while (i < 16) {
+      be(i) = le(15 - i)
+      i += 1
+    }
+    new java.math.BigInteger(be) // signed BE constructor
+  }
 
   /**
    * PA-3.3: Parse the JNI `serializeWithStats` framed return into (stats InternalRow, bytesBlob

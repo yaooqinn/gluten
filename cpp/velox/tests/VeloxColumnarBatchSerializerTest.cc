@@ -172,9 +172,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartitio
 // Expected RED failure: PA-2.2 GREEN's switch only covers BIGINT + REAL;
 // HUGEINT lands in the default (unsupported) branch -> hasLowerBound=false.
 // Test asserts EXPECT_TRUE(stats[0].hasLowerBound) which fails.
-// PA-6.5 B4: HUGEINT case removed from computeStats — emit_gate excluded
-// it anyway, leaving dead code. Now expected unsupported until PA-8 lands
-// proper long-Decimal marshal.
+// PA-8: HUGEINT (long-Decimal precision > 18) restored — 16B LE marshal.
 TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
@@ -189,9 +187,11 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFl
   auto vector = makeRowVector(children);
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
-  EXPECT_FALSE(stats[0].hasLowerBound)
-      << "PA-6.5 B4: HUGEINT (long Decimal P>=19) intentionally unsupported until PA-8";
-  EXPECT_FALSE(stats[0].hasUpperBound);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "PA-8: HUGEINT (long Decimal P>=19) supported via 16B LE marshal";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int128_t>(), static_cast<int128_t>(-50));
+  EXPECT_EQ(stats[0].upperBound.value<int128_t>(), static_cast<int128_t>(9999));
 }
 
 // PA-2.5a RED: framedSerializeWithStats top-level layout.
