@@ -28,9 +28,9 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
 
-  // PA-6.A serializeStats currently hard-calls stats.getLong(base)
+  // serializeStats hard-calls stats.getLong(base)
 
-  test("PA-6.A INT round-trip 4B LE preserves value") {
+  test("INT round-trip 4B LE preserves value") {
     val lo: Integer = Int.box(-2147483)
     val hi: Integer = Int.box(2147483)
     val stats: InternalRow = new GenericInternalRow(
@@ -51,9 +51,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(4) == 400L, "sizeInBytes roundtrip")
   }
 
-  // PA-6.B RED expected: ShortType not in dispatch -> UnsupportedOperationException.
+  // Without dispatch: ShortType -> UnsupportedOperationException.
   // GREEN: serializeStats + deserializeStats add ShortType branch writing 2 LE bytes.
-  test("PA-6.B SMALLINT round-trip 2B LE preserves value (incl negative)") {
+  test("SMALLINT round-trip 2B LE preserves value (incl negative)") {
     val lo: java.lang.Short = Short.box((-12345).toShort)
     val hi: java.lang.Short = Short.box(12345.toShort)
     val stats: InternalRow = new GenericInternalRow(
@@ -72,9 +72,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(3) == 200, "count roundtrip")
   }
 
-  // PA-6.C RED expected: ByteType not in dispatch -> UnsupportedOperationException.
+  // Without dispatch: ByteType -> UnsupportedOperationException.
   // GREEN: serializeStats + deserializeStats add ByteType branch writing 1 byte.
-  test("PA-6.C TINYINT round-trip 1B preserves value (incl negative)") {
+  test("TINYINT round-trip 1B preserves value (incl negative)") {
     val lo: java.lang.Byte = Byte.box((-128).toByte)
     val hi: java.lang.Byte = Byte.box(127.toByte)
     val stats: InternalRow = new GenericInternalRow(
@@ -94,9 +94,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(3) == 50, "count roundtrip")
   }
 
-  // PA-6.F.1 YearMonthIntervalType not in dispatch.
+  // YearMonthIntervalType not in dispatch.
 
-  test("PA-6.F.1 YearMonthInterval round-trip 4B LE (months as Int)") {
+  test("YearMonthInterval round-trip 4B LE (months as Int)") {
     val lo: Integer = Int.box(-12)
     val hi: Integer = Int.box(36)
     val stats: InternalRow = new GenericInternalRow(
@@ -115,9 +115,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(1) == hi, s"upper: expected $hi got ${read.getInt(1)}")
   }
 
-  // PA-6.F.2 DayTimeIntervalType not in dispatch.
+  // DayTimeIntervalType not in dispatch.
 
-  test("PA-6.F.2 DayTimeInterval round-trip 8B LE (microseconds as Long)") {
+  test("DayTimeInterval round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(-86400000000L)
     val hi: java.lang.Long = Long.box(86400000000L)
     val stats: InternalRow = new GenericInternalRow(
@@ -136,9 +136,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(1) == hi, s"upper: expected $hi got ${read.getLong(1)}")
   }
 
-  // PA-6.G.1 RED expected: DateType not in dispatch.
+  // Without dispatch: DateType -> UnsupportedOperationException.
   // GREEN: DateType reuses IntegerType branch (4 LE bytes, days since epoch).
-  test("PA-6.G.1 Date round-trip 4B LE (days since epoch as Int)") {
+  test("Date round-trip 4B LE (days since epoch as Int)") {
     val lo: Integer = Int.box(0) // 1970-01-01
     val hi: Integer = Int.box(20000) // ~2024
     val stats: InternalRow = new GenericInternalRow(
@@ -157,9 +157,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(1) == hi)
   }
 
-  // PA-6.G.2 RED expected: TimestampType not in dispatch.
+  // Without dispatch: TimestampType -> UnsupportedOperationException.
   // GREEN: TimestampType reuses LongType branch (8 LE bytes, microseconds).
-  test("PA-6.G.2 Timestamp round-trip 8B LE (microseconds as Long)") {
+  test("Timestamp round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(1700000000000000L)
     val hi: java.lang.Long = Long.box(1800000000000000L)
     val stats: InternalRow = new GenericInternalRow(
@@ -178,9 +178,9 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(1) == hi)
   }
 
-  // PA-6.G.3 RED expected: TimestampNTZType not in dispatch.
+  // Without dispatch: TimestampNTZType -> UnsupportedOperationException.
   // GREEN: TimestampNTZType reuses LongType branch (8 LE bytes, microseconds).
-  test("PA-6.G.3 TimestampNTZ round-trip 8B LE (microseconds as Long)") {
+  test("TimestampNTZ round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(0L)
     val hi: java.lang.Long = Long.box(2000000000000000L)
     val stats: InternalRow = new GenericInternalRow(

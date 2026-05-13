@@ -272,7 +272,7 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         // Truncate to 256B at the source so the JVM never sees > 256B (single source of truth).
         // Lower bound: prefix is byte-wise <= original. Upper bound: prefix +1 carry on the
         // rightmost byte to ensure encoded >= original; carry overflow on an all-0xFF prefix
-        // demotes supported=0. Mirrors the JVM-side encodeStringBounds; design 0008 sec 3.1.
+        // demotes supported=0. Mirrors the JVM-side encodeStringBounds.
         constexpr size_t kStatsStringTruncateLen = 256;
         auto* flat = child->asFlatVector<StringView>();
         StringView lo, hi;

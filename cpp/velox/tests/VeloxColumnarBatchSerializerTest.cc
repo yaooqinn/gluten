@@ -78,7 +78,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, serialize) {
 }
 
 // BIGINT FlatVector min/max scan: values [42, 7, 99, -3, 50] -> lo=-3, hi=99.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_2_1_testComputeStatsLongFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsBigintFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
 
   std::vector<VectorPtr> children = {
@@ -101,7 +101,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_1_testComputeStatsLongFlatVector) 
 // REAL FlatVector: no-NaN partition becomes supported; any NaN row poisons the
 // column to hasLowerBound=hasUpperBound=false (Spark NaN != NaN, would silently
 // drop matching rows under min/max pruning).
-TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartition) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsNaNRealPartitionPoisons) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -114,7 +114,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartitio
     auto stats = serializer->computeStats(vector);
     ASSERT_EQ(stats.size(), 1u);
     EXPECT_TRUE(stats[0].hasLowerBound)
-        << "REAL FlatVector w/o NaN must be supported after PA-2.2 GREEN";
+        << "REAL FlatVector w/o NaN must be supported";
     EXPECT_TRUE(stats[0].hasUpperBound);
   }
 
@@ -135,7 +135,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_2_testComputeStatsNaNFloatPartitio
 
 // HUGEINT (int128) FlatVector for LongDecimal(20, 4): values [100, -50, 9999]
 // -> lo=-50, hi=9999.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsHugeintDecimalFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -150,7 +150,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFl
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "PA-8: HUGEINT (long Decimal P>=19) supported via 16B LE marshal";
+      << "HUGEINT (long Decimal P>=19) supported via 16B LE marshal";
   EXPECT_TRUE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].lowerBound.value<int128_t>(), static_cast<int128_t>(-50));
   EXPECT_EQ(stats[0].upperBound.value<int128_t>(), static_cast<int128_t>(9999));
@@ -158,7 +158,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_4_testComputeStatsHugeintDecimalFl
 
 // framedSerializeWithStats top-level layout:
 //   [ magic(4) = 0xFE 0xCA 0x53 0x02 | statsLen(u32 LE) | statsBlob | bytesLen(u32 LE) | bytesBlob ]
-TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLayout) {
+TEST_F(VeloxColumnarBatchSerializerTest, framedSerializeWithStatsTopLayout) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -179,7 +179,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLay
   EXPECT_EQ(framed[2], static_cast<uint8_t>(0x53));
   EXPECT_EQ(framed[3], static_cast<uint8_t>(0x02));
 
-  // statsLen LE int32 -- post PA-2.5b this is non-zero. PA-2.5a only asserts
+  // statsLen LE int32 -- non-zero now that statsBlob is populated. The framing-only
   // the layout shape (offsets / framing), not the numeric statsLen value.
   uint32_t statsLen = static_cast<uint32_t>(framed[4]) |
                       (static_cast<uint32_t>(framed[5]) << 8) |
@@ -201,7 +201,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5a_testFramedSerializeWithStatsLay
 // statsBlob layout (BIGINT 1-col):
 //   [ numCols u32 LE ] per col [ supported u8 | nullCount u32 | count u32 |
 //     sizeInBytes u64 | lowerLen u32 | lower bytes | upperLen u32 | upper bytes ]
-TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
+TEST_F(VeloxColumnarBatchSerializerTest, statsBlobBigintLayout) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -219,7 +219,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
                       (static_cast<uint32_t>(framed[5]) << 8) |
                       (static_cast<uint32_t>(framed[6]) << 16) |
                       (static_cast<uint32_t>(framed[7]) << 24);
-  ASSERT_GE(statsLen, 4u) << "PA-2.5b: statsBlob must contain at least numCols(uint32)";
+  ASSERT_GE(statsLen, 4u) << "statsBlob must contain at least numCols(uint32)";
 
   // statsBlob starts at offset 8.
   auto readU32LE = [&](size_t off) {
@@ -257,7 +257,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
 
   uint64_t sizeInBytes = readU64LE(off);
   off += 8;
-  EXPECT_EQ(sizeInBytes, 0u) << "PA-2.5b uses 0 placeholder for sizeInBytes";
+  EXPECT_EQ(sizeInBytes, 0u) << "sizeInBytes is a 0 placeholder";
 
   // lowerBound: BIGINT -> 8 bytes int64 LE = -3.
   uint32_t lowerLen = readU32LE(off);
@@ -279,7 +279,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
 
 // INTEGER (int32) FlatVector min/max scan; covers Spark IntegerType / DateType /
 // YearMonthIntervalType which all map to Velox TypeKind::INTEGER.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_1_testComputeStatsIntegerFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsIntegerFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -290,16 +290,16 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_1_testComputeStatsIntegerFlatV
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "INTEGER FlatVector must be supported after PA-6.2 GREEN";
+      << "INTEGER FlatVector must be supported";
   EXPECT_TRUE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].lowerBound.value<int32_t>(), -2147483);
   EXPECT_EQ(stats[0].upperBound.value<int32_t>(), 2147483);
   EXPECT_EQ(stats[0].nullCount, 0);
 }
 
-// PA-6.2.A.2 RED: SMALLINT (int16) FlatVector min/max scan.
+// SMALLINT (int16) FlatVector min/max scan.
 // Spark ShortType -> Velox TypeKind::SMALLINT.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_2_testComputeStatsSmallintFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsSmallintFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -312,15 +312,15 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_2_testComputeStatsSmallintFlat
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "SMALLINT FlatVector must be supported after PA-6.2 GREEN";
+      << "SMALLINT FlatVector must be supported";
   EXPECT_TRUE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].lowerBound.value<int16_t>(), static_cast<int16_t>(-12345));
   EXPECT_EQ(stats[0].upperBound.value<int16_t>(), static_cast<int16_t>(12345));
 }
 
-// PA-6.2.A.3 RED: TINYINT (int8) FlatVector min/max scan.
+// TINYINT (int8) FlatVector min/max scan.
 // Spark ByteType -> Velox TypeKind::TINYINT.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_3_testComputeStatsTinyintFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsTinyintFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -333,7 +333,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_3_testComputeStatsTinyintFlatV
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "TINYINT FlatVector must be supported after PA-6.2 GREEN";
+      << "TINYINT FlatVector must be supported";
   EXPECT_TRUE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].lowerBound.value<int8_t>(), static_cast<int8_t>(-128));
   EXPECT_EQ(stats[0].upperBound.value<int8_t>(), static_cast<int8_t>(127));
@@ -341,7 +341,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_3_testComputeStatsTinyintFlatV
 
 // TIMESTAMP FlatVector min/max scan; wire emit via Timestamp::toMicros() so it
 // shares the JVM LongType 8B arm (Spark Timestamp / TimestampNTZ physical = Long us).
-TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_testComputeStatsTimestampFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsTimestampFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -354,7 +354,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_testComputeStatsTimestampFlatV
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "TIMESTAMP FlatVector must be supported after PA-6.2.E GREEN";
+      << "TIMESTAMP FlatVector must be supported";
   EXPECT_TRUE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].lowerBound.value<Timestamp>(), t1);
   EXPECT_EQ(stats[0].upperBound.value<Timestamp>(), t3);
@@ -362,7 +362,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_testComputeStatsTimestampFlatV
 }
 
 // TIMESTAMP wire: lowerLen=8 + LE int64 microseconds (JVM LongType arm).
-TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_2_testFramedSerializeWithStatsTimestamp) {
+TEST_F(VeloxColumnarBatchSerializerTest, framedSerializeWithStatsTimestamp) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -403,7 +403,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_2_testFramedSerializeWithStats
 
 // VARCHAR FlatVector min/max via StringView. memcmp byte-order matches Spark
 // ByteArray.compareBinary; variant(std::string) owns the bytes after the scan.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_9_testComputeStatsVarcharFlatVector) {
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsVarcharFlatVector) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -417,7 +417,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_9_testComputeStatsVarcharFlatVector)
   auto stats = serializer->computeStats(vector);
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_TRUE(stats[0].hasLowerBound)
-      << "VARCHAR FlatVector must be supported after PA-9 GREEN";
+      << "VARCHAR FlatVector must be supported";
   EXPECT_TRUE(stats[0].hasUpperBound);
   // Unsigned byte order: "apple"(0x61) < "banana"(0x62) < "\xc2\xa9copy"(0xc2).
   EXPECT_EQ(stats[0].lowerBound.value<TypeKind::VARCHAR>(), std::string("apple"));
@@ -427,7 +427,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_9_testComputeStatsVarcharFlatVector)
 }
 
 // VARCHAR wire: lowerLen u32 LE + raw UTF-8 bytes.
-TEST_F(VeloxColumnarBatchSerializerTest, PA_9_2_testFramedSerializeWithStatsVarchar) {
+TEST_F(VeloxColumnarBatchSerializerTest, framedSerializeWithStatsVarchar) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -468,7 +468,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_9_2_testFramedSerializeWithStatsVarc
 // TIMESTAMP with sub-us nanos must conservatively widen: floor(lo), ceil(hi).
 // Naive toMicros() floors both, which would shrink the interval and false-negative
 // drop rows whose true ts has nanos % 1000 != 0.
-TEST_F(VeloxColumnarBatchSerializerTest, CB_1_testTimestampNanosCeilUpperFloorLower) {
+TEST_F(VeloxColumnarBatchSerializerTest, timestampNanosCeilUpperFloorLower) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -500,7 +500,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_1_testTimestampNanosCeilUpperFloorLo
   }
   const int64_t expectedLo = s * 1'000'000LL;
   EXPECT_EQ(loMicros, expectedLo)
-      << "CB-1: lower must be floor(lo). Got " << loMicros << ", want " << expectedLo;
+      << "lower must be floor(lo). Got " << loMicros << ", want " << expectedLo;
   p += 8;
 
   // upper: upperLen=8, payload = ceil hi = s*1e6 + 1000 (NOT s*1e6+999)
@@ -514,12 +514,12 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_1_testTimestampNanosCeilUpperFloorLo
   }
   const int64_t expectedHi = s * 1'000'000LL + 1000;  // ceil to next us
   EXPECT_EQ(hiMicros, expectedHi)
-      << "CB-1: upper must be ceil(hi) when nanos%1000 != 0. Got "
+      << "upper must be ceil(hi) when nanos%1000 != 0. Got "
       << hiMicros << ", want " << expectedHi;
 }
 
-// CB-1.2 RED: when nanos % 1000 == 0 (exact us), no ceil adjustment needed.
-TEST_F(VeloxColumnarBatchSerializerTest, CB_1_2_testTimestampExactMicrosNoCeil) {
+// When nanos % 1000 == 0 (exact us), no ceil adjustment needed.
+TEST_F(VeloxColumnarBatchSerializerTest, timestampExactMicrosNoCeil) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -540,11 +540,11 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_1_2_testTimestampExactMicrosNoCeil) 
   int64_t hiMicros = 0;
   for (int i = 0; i < 8; ++i) hiMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
   EXPECT_EQ(hiMicros, s * 1'000'000LL + 1)
-      << "CB-1.2: upper exact us should NOT ceil-adjust beyond toMicros";
+      << "upper exact us should NOT ceil-adjust beyond toMicros";
 }
 
 // VARCHAR cpp truncates to 256B at source (single source of truth).
-TEST_F(VeloxColumnarBatchSerializerTest, CB_2_testVarcharCppTruncates256B) {
+TEST_F(VeloxColumnarBatchSerializerTest, varcharTruncatesAt256Bytes) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -565,17 +565,17 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_2_testVarcharCppTruncates256B) {
   const uint8_t* p = framed.data() + 8;
   EXPECT_EQ(p[0], 1u);  // numCols
   p += 4;
-  EXPECT_EQ(p[0], 1u) << "CB-2: column should still be supported=1 after cpp truncate";
+  EXPECT_EQ(p[0], 1u) << "column should still be supported=1 after cpp truncate";
   p += 1 + 4 + 4 + 8;  // skip supported + nullCount + count + sizeInBytes
 
   // lower: 256B prefix of 'a'
   uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-  EXPECT_EQ(lowerLen, 256u) << "CB-2: cpp must truncate lower to 256B";
+  EXPECT_EQ(lowerLen, 256u) << "cpp must truncate lower to 256B";
   p += 4;
   for (uint32_t i = 0; i < 256u; ++i) {
     if (p[i] != 'a') {
-      ADD_FAILURE() << "CB-2 lower byte " << i << " = " << static_cast<int>(p[i])
+      ADD_FAILURE() << "lower byte " << i << " = " << static_cast<int>(p[i])
                     << ", expected 'a'";
       break;
     }
@@ -585,21 +585,21 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_2_testVarcharCppTruncates256B) {
   // upper: 255B 'm' + 1B 'n' (carry)
   uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-  EXPECT_EQ(upperLen, 256u) << "CB-2: cpp must truncate upper to 256B";
+  EXPECT_EQ(upperLen, 256u) << "cpp must truncate upper to 256B";
   p += 4;
   for (uint32_t i = 0; i < 255u; ++i) {
     if (p[i] != 'm') {
-      ADD_FAILURE() << "CB-2 upper byte " << i << " = " << static_cast<int>(p[i])
+      ADD_FAILURE() << "upper byte " << i << " = " << static_cast<int>(p[i])
                     << ", expected 'm'";
       break;
     }
   }
   EXPECT_EQ(p[255], 'n')
-      << "CB-2: upper last byte should be 'm'+1='n' (carry), got " << static_cast<int>(p[255]);
+      << "upper last byte should be 'm'+1='n' (carry), got " << static_cast<int>(p[255]);
 }
 
 // All-0xFF upper prefix: carry overflows -> demote supported=0.
-TEST_F(VeloxColumnarBatchSerializerTest, CB_2_2_testVarcharCppCarryOverflowDemote) {
+TEST_F(VeloxColumnarBatchSerializerTest, varcharCarryOverflowDemotesUnsupported) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -615,11 +615,11 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_2_2_testVarcharCppCarryOverflowDemot
   const uint8_t* p = framed.data() + 8;
   p += 4;  // numCols
   EXPECT_EQ(p[0], 0u)
-      << "CB-2.2: 300x 0xFF upper must demote to supported=0 (carry overflow)";
+      << "300x 0xFF upper must demote to supported=0 (carry overflow)";
 }
 
 // Regression: short string (<= 256B) must round-trip unchanged.
-TEST_F(VeloxColumnarBatchSerializerTest, CB_2_3_testVarcharShortStringIntact) {
+TEST_F(VeloxColumnarBatchSerializerTest, varcharShortStringRoundTripsIntact) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
 
@@ -633,13 +633,13 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_2_3_testVarcharShortStringIntact) {
   p += 4 + 1 + 4 + 4 + 8;  // numCols + supported + n/c/sz
   uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-  EXPECT_EQ(lowerLen, 5u) << "CB-2.3: short lower bytes intact (no truncate)";
+  EXPECT_EQ(lowerLen, 5u) << "short lower bytes intact (no truncate)";
   p += 4;
   EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 5), "apple");
   p += 5;
   uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
       (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-  EXPECT_EQ(upperLen, 6u) << "CB-2.3: short upper bytes intact (no truncate, no carry)";
+  EXPECT_EQ(upperLen, 6u) << "short upper bytes intact (no truncate, no carry)";
   p += 4;
   EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 6), "banana");
 }

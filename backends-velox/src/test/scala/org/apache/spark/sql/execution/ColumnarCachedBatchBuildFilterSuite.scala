@@ -33,9 +33,9 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class ColumnarCachedBatchBuildFilterSuite extends AnyFunSuite {
 
-  // PA-3.1 v1 binary (stats=null) + EqualTo predicate must NOT drop the batch.
+  // V1 binary (stats=null) + EqualTo predicate must NOT drop the batch.
 
-  test("PA-3.1 buildFilter must direct stats=null batches through under EqualTo predicate") {
+  test("buildFilter must direct stats=null batches through under EqualTo predicate") {
     val serializer = new ColumnarCachedBatchSerializer
     val attr = AttributeReference("id", IntegerType, nullable = false)()
     val predicate = EqualTo(attr, Literal(5))
@@ -43,7 +43,7 @@ class ColumnarCachedBatchBuildFilterSuite extends AnyFunSuite {
 
     val filter = serializer.buildFilter(Seq(predicate), cachedAttributes)
 
-    // Three v1 binary batches: stats=null. A correct PA-3.1 wrapper directs
+    // Three v1 binary batches: stats=null. A correct wrapper directs
     // them all through (no pruning, since we have no stats to prune on).
     val batches: Iterator[CachedBatch] = Iterator(
       CachedColumnarBatch(
@@ -64,7 +64,7 @@ class ColumnarCachedBatchBuildFilterSuite extends AnyFunSuite {
     )
 
     // GREEN expectation: all 3 batches returned (stats=null -> direct through).
-    // RED expectation (pre-PA-3.1): NPE thrown at partitionFilter.eval(null)
+    // Without the wrapper: NPE thrown at partitionFilter.eval(null)
     //   OR silent drop (if naive occupier-row placeholder was used).
     val result = filter(0, batches).toList
 

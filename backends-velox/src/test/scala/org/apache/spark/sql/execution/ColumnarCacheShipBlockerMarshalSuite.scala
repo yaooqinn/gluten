@@ -32,9 +32,9 @@ import java.util.Arrays
  */
 class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
 
-  // PA-7 (was PA-5.C): Decimal(10, 2) -- precision <= 18 uses Long backing
+  // Decimal(10, 2) -- precision <= 18 uses Long backing
 
-  test("PA-7 Decimal(10, 2) round-trip preserves value") {
+  test("Decimal(10, 2) round-trip preserves value") {
     val lo = Decimal(BigDecimal("1.50"), 10, 2)
     val hi = Decimal(BigDecimal("99.99"), 10, 2)
     val stats: InternalRow = new GenericInternalRow(
@@ -49,9 +49,9 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // PA-8 (was PA-5.D): Decimal(30, 5) -- precision > 18 uses BigInteger /
+  // Decimal(30, 5) -- precision > 18 uses BigInteger /
 
-  test("PA-8 Decimal(30, 5) round-trip preserves big value") {
+  test("Decimal(30, 5) round-trip preserves big value") {
     val big = BigDecimal("12345678901234567890.12345")
     val lo = Decimal(big.bigDecimal.negate(), 30, 5)
     val hi = Decimal(big, 30, 5)
@@ -67,9 +67,9 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // PA-9 (was PA-5.E ship blocker NS3): String byte-wise lex prune.
+  // String byte-wise lex prune.
 
-  test("PA-9 String byte-wise lex round-trip preserves UTF-8 bytes") {
+  test("String byte-wise lex round-trip preserves UTF-8 bytes") {
     val lo = UTF8String.fromString("apple")
     // UTF-8 bytes for two CJK code points (U+4E2D U+6587) constructed from hex
     // to keep this file ASCII-only (scalastyle nonascii filter).
@@ -91,9 +91,9 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // PA-9 truncate path: 300-byte upper triggers truncate to 256B + +1 carry.
+  // Truncate path: 300-byte upper triggers truncate to 256B + +1 carry.
   // After truncate, decoded upper must compare byte-wise >= the original.
-  test("PA-9 String truncation to 256B widens upper bound monotonically") {
+  test("String truncation to 256B widens upper bound monotonically") {
     val loBytes = new Array[Byte](100)
     Arrays.fill(loBytes, 'a'.toByte)
     // Upper: 300 bytes of 'm' followed by trailing chars. Truncated prefix
@@ -122,9 +122,9 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
       s"upper byte 255 should be 'n' (carry), got ${readHiArr(255)}")
   }
 
-  // PA-9 carry-overflow demote: upper = 300 bytes of 0xFF cannot widen
+  // Carry-overflow demote: upper = 300 bytes of 0xFF cannot widen
 
-  test("PA-9 String carry overflow demotes column to unsupported") {
+  test("String carry overflow demotes column to unsupported") {
     val loBytes = new Array[Byte](10)
     Arrays.fill(loBytes, 0xff.toByte)
     val hiBytes = new Array[Byte](300)

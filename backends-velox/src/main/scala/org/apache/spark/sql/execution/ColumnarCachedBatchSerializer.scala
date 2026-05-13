@@ -727,20 +727,17 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
                 "ColumnarCachedBatchSerializer#serialize"))
             val handle =
               ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch)
-            // PA-3.3: route through serializeWithStats when the JNI extension is
-            // available (cpp PA-2.5c) AND the partition-stats conf is enabled
-            // (PA-4 default-off ship gate). Capability is cached after first probe
-            // (gluten-arrow PA-2.6 helper). When unavailable -- e.g. running
-            // against an older cpp libgluten.so, or when the conf is left off --
-            // fall back to the original serialize() path and emit stats=null;
-            // PA-3.1 lazy-split iterator wrapper will then direct such batches
-            // through without pruning.
+            // Route through serializeWithStats when the JNI extension is available AND the
+            // partition-stats conf is enabled. Capability is cached after first probe. When
+            // unavailable (older libgluten.so without the symbol, or conf left off) we fall back
+            // to the original serialize() path and emit stats=null; the buildFilter wrapper
+            // directs such batches through without pruning.
             val partitionStatsEnabled =
               GlutenConfig.get.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED)
             if (partitionStatsEnabled && ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
               val framed = jni.serializeWithStats(handle)
-              // PA-6.0: convert Seq[Attribute] to StructType once and carry per-batch
-              // so Kryo (spill / disk cache) read path can dispatch by dataType.
+              // Carry the per-batch StructType so the Kryo (spill / disk cache) read path can
+              // dispatch by dataType.
               val structSchema = StructType(
                 schema.map(
                   a =>

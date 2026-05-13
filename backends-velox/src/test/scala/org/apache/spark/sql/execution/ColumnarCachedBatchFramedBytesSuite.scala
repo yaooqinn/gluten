@@ -51,9 +51,9 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     out.write((v >>> 24) & 0xff)
   }
 
-  // PA-3.3.A RED: parseFramedBytes round-trips stats + bytesBlob.
+  // parseFramedBytes round-trips stats + bytesBlob.
   // Expected RED failure: parseFramedBytes does not exist yet.
-  test("PA-3.3.A parseFramedBytes round-trip BIGINT 1-col stats + bytesBlob") {
+  test("parseFramedBytes round-trip BIGINT 1-col stats + bytesBlob") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
     val payload = Array[Byte](1, 2, 3, 4, 5)
@@ -72,9 +72,9 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     assert(parsedStats.getLong(4) === 64L)
   }
 
-  // PA-3.3.B RED: corrupt magic must fail eagerly.
+  // Corrupt magic must fail eagerly.
   // Expected RED failure: parseFramedBytes does not exist yet (same as A).
-  test("PA-3.3.B corrupt magic fails eagerly with clear message") {
+  test("corrupt magic fails eagerly with clear message") {
     val payload = Array[Byte](1, 2, 3)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](0L, 0L, 0, 1, 1L))
@@ -90,8 +90,8 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
       s"expected 'magic' in error, got: ${ex.getMessage}")
   }
 
-  // PA-3.3.C RED: truncated framing (declared statsLen exceeds remaining buffer).
-  test("PA-3.3.C truncated framed bytes fails eagerly") {
+  // Truncated framing (declared statsLen exceeds remaining buffer).
+  test("truncated framed bytes fails eagerly") {
     val payload = Array[Byte](1, 2, 3)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](0L, 0L, 0, 1, 1L))

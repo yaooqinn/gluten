@@ -58,7 +58,7 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
 
   // RED case 1: case class currently has 3 fields (numRows, sizeInBytes, bytes).
 
-  test("PA-1.1 testStatsFieldRoundTripV2") {
+  test("V2 binary stats field round-trip") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
     val batch = CachedColumnarBatch(
@@ -81,11 +81,11 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.stats.getLong(4) === 64L, "sizeInBytes at slot 4")
   }
 
-  // Helper: write a v1 (pre-PA-1) binary using the same Kryo wire conventions
+  // Helper: write a legacy V1 (no-stats) binary using the same Kryo wire conventions
   // the legacy serializer used: writeInt(numRows) [4-byte BE] + writeLong +
   // writeInt(bytes.length+1) [4-byte BE] + writeBytes(bytes). No magic prefix,
   // no stats field.
-  // Faithful v1 (pre-PA-1) wire: writeInt(numRows) [4-byte BE] + writeLong +
+  // Faithful legacy V1 wire: writeInt(numRows) [4-byte BE] + writeLong +
   // writeInt(bytes.length+1) [4-byte BE] + writeBytes(bytes). No magic, no
   // stats, no Kryo refId envelope -- matches what production read path sees
   // via direct Serializer.read invocation.
@@ -111,7 +111,7 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
 
   // RED case 2: backward compat -- v1 binary (without magic prefix) read by v2
 
-  test("PA-1.2 testKryoV1Backwards") {
+  test("V1 binary backwards-compat read") {
     val payload = Array[Byte](9, 8, 7)
     val v1Binary = craftV1Binary(numRows = 7, sizeInBytes = 123L, payload = payload)
 
@@ -123,9 +123,9 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.stats === null, "v1 binary read must yield stats=null (graceful degrade)")
   }
 
-  // PA-1.3 NB1 ship-blocker -- the 4-byte magic-prefix design choice (vs naive
+  // The 4-byte magic-prefix design choice (vs naive
 
-  test("PA-1.3 testV1MagicPrefixGuardsAgainstSilentCorruption") {
+  test("V1 magic-prefix guards against silent corruption") {
     // (a) Production reader: numRows=258 v1 binary should be read correctly.
     // BE encoding of 258 is [0x00, 0x00, 0x01, 0x02], so v1 binary's first
     // byte is 0x00. (Construction sanity below.)

@@ -31,9 +31,9 @@ import java.nio.{ByteBuffer, ByteOrder}
  */
 class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
 
-  // PA-3.2.A statsBlob produced by serializeStats matches the cpp-aligned
+  // statsBlob produced by serializeStats matches the cpp-aligned
 
-  test("PA-3.2.A statsBlob LE numCols + BIGINT cell round-trip byte-for-byte") {
+  test("statsBlob LE numCols + BIGINT cell round-trip byte-for-byte") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
     val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
@@ -63,9 +63,9 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
       "statsBlob must match cpp-aligned LE wire format byte-for-byte")
   }
 
-  // PA-3.2.B round-trip serializeStats -> deserializeStats yields an
+  // Round-trip serializeStats -> deserializeStats yields an
 
-  test("PA-3.2.B serializeStats then deserializeStats round-trip BIGINT 1-col") {
+  test("serializeStats then deserializeStats round-trip BIGINT 1-col") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](-7L, 999L, 3, 100, 1024L))
     val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
@@ -79,9 +79,9 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
     assert(read.getLong(4) === 1024L, "sizeInBytes at slot 4")
   }
 
-  // PA-3.2.C corrupt blob (numCols=huge) should fail eagerly with a clear
+  // Corrupt blob (numCols=huge) should fail eagerly with a clear
 
-  test("PA-3.2.C corrupt statsBlob (numCols out of range) fails eagerly") {
+  test("corrupt statsBlob (numCols out of range) fails eagerly") {
     // Craft a blob claiming numCols=Int.MaxValue: 0xFF FF FF 7F
     val corruptNumCols = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
       .putInt(Int.MaxValue).array()
@@ -93,9 +93,9 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
       s"expected numCols range guard, got: ${ex.getMessage}")
   }
 
-  // PA-3.2.D RED: unsupported col (supported=0) round-trips with null
+  // Unsupported col (supported=0) round-trips with null
   // lowerBound / upperBound and preserves nullCount / count / sizeInBytes.
-  test("PA-3.2.D unsupported col round-trip preserves null bounds + metrics") {
+  test("unsupported col round-trip preserves null bounds + metrics") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](null, null, 5, 50, 200L))
     val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)

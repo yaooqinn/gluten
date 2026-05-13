@@ -28,13 +28,13 @@ import java.util.Locale
  * ColumnarCachedBatchE2ESuite under fork CI.
  */
 class ColumnarCachePartitionStatsConfSuite extends SparkFunSuite {
-  test("PA-4.A conf key and default-off") {
+  test("conf key and default-off") {
     val entry = GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED
     assert(entry.key == "spark.gluten.sql.columnar.tableCache.partitionStats.enabled")
-    assert(entry.defaultValue.contains(false), "PA-4 ships default-off")
+    assert(entry.defaultValue.contains(false), "ships default-off")
   }
 
-  test("PA-4.B conf doc mentions default-off rationale") {
+  test("conf doc mentions default-off rationale") {
     val doc = GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED.doc
     assert(
       doc.toLowerCase(Locale.ROOT).contains("default"),

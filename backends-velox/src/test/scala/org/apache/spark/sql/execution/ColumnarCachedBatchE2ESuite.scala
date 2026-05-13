@@ -74,7 +74,7 @@ class ColumnarCachedBatchE2ESuite
       .cache()
   }
 
-  test("PA-3.5.A e2e cache + equality filter: no crash + correct result") {
+  test("e2e cache + equality filter: no crash + correct result") {
     val cached = cacheRange()
     try {
       cached.count() // materialize cache (triggers serializeWithStats path)
@@ -85,7 +85,7 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  test("PA-3.5.B plan contains InMemoryTableScanExec + our serializer kicked in") {
+  test("plan contains InMemoryTableScanExec + our serializer kicked in") {
     val cached = cacheRange()
     try {
       cached.count()
@@ -102,14 +102,14 @@ class ColumnarCachedBatchE2ESuite
         serName == "ColumnarCachedBatchSerializer",
         s"expected ColumnarCachedBatchSerializer, got $serName"
       )
-      // Force execution so numOutputRows is populated for PA-3.5.C reading.
+      // Force execution so numOutputRows is populated for the next assertion.
       df.count()
     } finally {
       cached.unpersist()
     }
   }
 
-  test("PA-3.5.C numOutputRows reflects post-filter row count (significantly < N)") {
+  test("numOutputRows reflects post-filter row count (significantly < N)") {
     val cached = cacheRange()
     try {
       cached.count()
@@ -126,7 +126,7 @@ class ColumnarCachedBatchE2ESuite
       // node may legitimately emit zero rows (the surviving row comes from cache
       // metadata / pivot resolution at a higher layer when Gluten native scan
       // uses its own metrics path). The semantic correctness is anchored by
-      // PA-3.5.A (result == 1) and the precise prune behavior by PA-3.4
+      // the equality-result test (result == 1) and the precise prune behavior by
       // BuildFilterPruneSuite; this case only needs to refute full-scan.
       val upperBound = (N / P) * 2
       assert(
@@ -139,9 +139,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-5.A ship blocker (BL7): all-null Long column. partition that contains
+  // All-null Long column. Partition that contains
 
-  test("PA-5.A all-null Long column: cache + equality filter no crash + correct result") {
+  test("all-null Long column: cache + equality filter no crash + correct result") {
     val df = spark
       .range(N)
       .select(lit(null).cast("bigint").as("k"))
@@ -158,9 +158,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-5.B ship blocker (NB4): partition containing NaN Float must NOT have
+  // Partition containing NaN Float must NOT have
 
-  test("PA-10 Float NaN partition: filter on non-NaN not silently pruned") {
+  test("Float NaN partition: filter on non-NaN not silently pruned") {
     val df = spark
       .range(N)
       .select(
@@ -184,9 +184,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-6.2.D Date e2e prune correctness: with cpp INTEGER computeStats +
+  // Date e2e prune correctness: with cpp INTEGER computeStats +
 
-  test("PA-6.2.D Date column equality filter: prune via INTEGER stats (4B LE)") {
+  test("Date column equality filter: prune via INTEGER stats (4B LE)") {
     import org.apache.spark.sql.functions.{date_add, lit => sparkLit}
     val base = sparkLit("2020-01-01").cast("date")
     val cached = spark
@@ -216,9 +216,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-6.5 B1 regression: multi-column cache must not crash with
+  // Regression: multi-column cache must not crash with
 
-  test("PA-6.5 B1 multi-column cache: no IndexOOB + correct result") {
+  test("multi-column cache: no IndexOOB + correct result") {
     val cached = spark
       .range(N)
       .selectExpr(
@@ -236,9 +236,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-6.5 B2 regression: short-Decimal source column must not crash
+  // Regression: short-Decimal source column must not crash
 
-  test("PA-6.5 B2 Decimal column cache: no UOE crash on materialize + read") {
+  test("Decimal column cache: no UOE crash on materialize + read") {
     val cached = spark
       .range(N)
       .selectExpr("cast(id as decimal(10, 2)) as d")
@@ -253,9 +253,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-8.5 SB1 regression: IsNotNull predicate must NOT silently skip a
+  // Regression: IsNotNull predicate must NOT silently skip a
 
-  test("PA-8.5 SB1 IsNotNull predicate honors vanilla count semantics") {
+  test("IsNotNull predicate honors vanilla count semantics") {
     val df = spark
       .range(N)
       .selectExpr("if(id % 3 = 0, cast(null as bigint), id) as k") // ~33% nulls
@@ -273,9 +273,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-6.2.E e2e Timestamp prune: TimestampType physically Long microseconds
+  // Timestamp e2e prune: TimestampType physically Long microseconds
 
-  test("PA-6.2.E Timestamp column equality filter: prune via Long us stats (8B LE)") {
+  test("Timestamp column equality filter: prune via Long us stats (8B LE)") {
     import org.apache.spark.sql.functions.{lit => sparkLit}
     // Build N rows of distinct timestamps, one second apart starting at epoch
     // 2024-01-01T00:00:00Z (= 1704067200 seconds). Pivot at second N/2.
@@ -307,9 +307,9 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // PA-9 e2e String prune sentinel. cpp scanMinMax<StringView> + variant
+  // String e2e prune sentinel. cpp scanMinMax<StringView> + variant
 
-  test("PA-9 String column equality filter: prune via byte-unsigned stats") {
+  test("String column equality filter: prune via byte-unsigned stats") {
     val cached = spark
       .range(N)
       .selectExpr("concat('k_', lpad(cast(id as string), 4, '0')) as s")
