@@ -200,7 +200,7 @@ object CachedColumnarBatchKryoSerializer {
       case FloatType => true // 4B IEEE 754; NaN guard in cpp scanMinMax
       case DoubleType => true // 8B IEEE 754; NaN guard in cpp scanMinMax
       case BooleanType => true
-      case StringType => true // truncated to 256B; see encodeStringBounds
+      case _: StringType => true // truncated to 256B; see encodeStringBounds (any collation)
       case _ => false
     }
 
@@ -226,7 +226,7 @@ object CachedColumnarBatchKryoSerializer {
       // For String, pre-compute the truncated payload so an all-0xFF carry overflow
       // can demote `supported` *before* the supported byte is written.
       val isStringCol = (schema != null) && hasLower && hasUpper &&
-        (schema(col).dataType eq StringType)
+        schema(col).dataType.isInstanceOf[StringType]
       val stringPayload: Option[(Array[Byte], Array[Byte])] =
         if (isStringCol) {
           val loB = stats.getUTF8String(base).getBytes
@@ -294,7 +294,7 @@ object CachedColumnarBatchKryoSerializer {
             baos.write(if (stats.getBoolean(base)) 1 else 0)
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base + 1)) 1 else 0)
-          case StringType =>
+          case _: StringType =>
             // Pre-validated: encodeStringBounds returned Some, otherwise we'd have demoted.
             val (lo, hi) = stringPayload.get
             writeU32LE(baos, lo.length)
@@ -318,8 +318,8 @@ object CachedColumnarBatchKryoSerializer {
     val buf = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
     val numCols = buf.getInt
     require(
-      numCols >= 0 && numCols <= 4096,
-      s"corrupt statsBlob: numCols=$numCols out of valid range [0, 4096]")
+      numCols >= 0 && numCols <= Int.MaxValue / 5,
+      s"corrupt statsBlob: numCols=$numCols out of valid range")
     val row = new GenericInternalRow(numCols * 5)
     var col = 0
     while (col < numCols) {
@@ -332,6 +332,11 @@ object CachedColumnarBatchKryoSerializer {
         val dt: DataType =
           if (schema == null) LongType else schema(col).dataType
         val lowerLen = buf.getInt
+        require(
+          lowerLen >= 0 && lowerLen <= STRING_BOUND_TRUNCATE_LEN,
+          s"lowerLen=$lowerLen out of range [0, $STRING_BOUND_TRUNCATE_LEN] " +
+            s"(likely cpp/JVM wire mismatch)"
+        )
         dt match {
           case IntegerType | DateType | _: YearMonthIntervalType =>
             require(lowerLen == 4, s"Integer-family expects 4-byte lowerBound, got $lowerLen")
@@ -396,7 +401,7 @@ object CachedColumnarBatchKryoSerializer {
             val upperLenB = buf.getInt
             require(upperLenB == 1, s"BooleanType expects 1B upperBound, got $upperLenB")
             row.update(base + 1, buf.get != 0)
-          case StringType =>
+          case _: StringType =>
             require(
               lowerLen >= 0 && lowerLen <= 256,
               s"StringType expects lowerBound in [0, 256], got $lowerLen")
