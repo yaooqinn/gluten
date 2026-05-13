@@ -165,6 +165,42 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
+      case TypeKind::INTEGER: {
+        auto* flat = child->asFlatVector<int32_t>();
+        int32_t lo = 0, hi = 0;
+        supported = scanMinMax<int32_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
+      case TypeKind::SMALLINT: {
+        auto* flat = child->asFlatVector<int16_t>();
+        int16_t lo = 0, hi = 0;
+        supported = scanMinMax<int16_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
+      case TypeKind::TINYINT: {
+        auto* flat = child->asFlatVector<int8_t>();
+        int8_t lo = 0, hi = 0;
+        supported = scanMinMax<int8_t>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
       case TypeKind::REAL: {
         auto* flat = child->asFlatVector<float>();
         float lo = 0.f, hi = 0.f;
@@ -223,25 +259,56 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
     }
   };
   auto pushI64LE = [&](int64_t v) { pushU64(static_cast<uint64_t>(v)); };
+  auto pushU16LE = [&](uint16_t v) {
+    statsBlob.push_back(static_cast<uint8_t>(v & 0xFF));
+    statsBlob.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  };
 
   pushU32(numCols);
   for (const auto& s : perCol) {
-    // PA-2.5b: only BIGINT lowerBound/upperBound is currently emitted as 8B LE.
-    // REAL / HUGEINT marshaling lands in follow-up slices. For now treat any
-    // non-int64 variant as unsupported even if computeStats reported supported
-    // (so we don't desync wire format with parsers expecting 8B for BIGINT).
+    // PA-6.2.B: dispatch by Variant typeKind for BIGINT/INTEGER/SMALLINT/TINYINT.
+    // Width matches JVM wire format (writeU64/U32/U16LE / 1B). REAL / HUGEINT
+    // marshaling still lands in follow-up slices.
+    auto kind = s.lowerBound.kind();
     bool emitSupported = s.hasLowerBound && s.hasUpperBound &&
-        s.lowerBound.kind() == facebook::velox::TypeKind::BIGINT &&
-        s.upperBound.kind() == facebook::velox::TypeKind::BIGINT;
+        s.lowerBound.kind() == s.upperBound.kind() &&
+        (kind == facebook::velox::TypeKind::BIGINT ||
+         kind == facebook::velox::TypeKind::INTEGER ||
+         kind == facebook::velox::TypeKind::SMALLINT ||
+         kind == facebook::velox::TypeKind::TINYINT);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     pushU32(numRows);  // count = rowVector->size()
     pushU64(0);        // sizeInBytes placeholder (PA-2.5b)
     if (emitSupported) {
-      pushU32(8);
-      pushI64LE(s.lowerBound.value<int64_t>());
-      pushU32(8);
-      pushI64LE(s.upperBound.value<int64_t>());
+      switch (kind) {
+        case facebook::velox::TypeKind::BIGINT:
+          pushU32(8);
+          pushI64LE(s.lowerBound.value<int64_t>());
+          pushU32(8);
+          pushI64LE(s.upperBound.value<int64_t>());
+          break;
+        case facebook::velox::TypeKind::INTEGER:
+          pushU32(4);
+          pushU32(static_cast<uint32_t>(s.lowerBound.value<int32_t>()));
+          pushU32(4);
+          pushU32(static_cast<uint32_t>(s.upperBound.value<int32_t>()));
+          break;
+        case facebook::velox::TypeKind::SMALLINT:
+          pushU32(2);
+          pushU16LE(static_cast<uint16_t>(s.lowerBound.value<int16_t>()));
+          pushU32(2);
+          pushU16LE(static_cast<uint16_t>(s.upperBound.value<int16_t>()));
+          break;
+        case facebook::velox::TypeKind::TINYINT:
+          pushU32(1);
+          pushU8(static_cast<uint8_t>(s.lowerBound.value<int8_t>()));
+          pushU32(1);
+          pushU8(static_cast<uint8_t>(s.upperBound.value<int8_t>()));
+          break;
+        default:
+          break;
+      }
     }
   }
   const uint32_t statsLen = static_cast<uint32_t>(statsBlob.size());

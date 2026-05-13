@@ -341,4 +341,74 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_2_5b_testStatsBlobBigintLayout) {
   EXPECT_EQ(off, 8u + statsLen) << "statsBlob content must exactly match statsLen";
 }
 
+// PA-6.2.A.1 RED: INTEGER (int32) FlatVector min/max scan.
+//
+// Scope: Spark IntegerType / DateType / YearMonthIntervalType all map to Velox
+// TypeKind::INTEGER (4-byte signed Int) per ~/repos/velox/velox/type/Type.h
+// line 78. Required for D-A5 Layer A full-type alignment with vanilla
+// SimpleMetricsCachedBatch (see ../../investigations/0007 §G1 integer family).
+//
+// Expected RED failure: PA-2.* GREEN switch covers BIGINT / REAL / HUGEINT
+// only; INTEGER falls into the default branch -> hasLowerBound=false. Test
+// asserts EXPECT_TRUE(stats[0].hasLowerBound) which fails.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_1_testComputeStatsIntegerFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int32_t>({100, -2147483, 2147483, 0, 42}),
+  };
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "INTEGER FlatVector must be supported after PA-6.2 GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int32_t>(), -2147483);
+  EXPECT_EQ(stats[0].upperBound.value<int32_t>(), 2147483);
+  EXPECT_EQ(stats[0].nullCount, 0);
+}
+
+// PA-6.2.A.2 RED: SMALLINT (int16) FlatVector min/max scan.
+// Spark ShortType -> Velox TypeKind::SMALLINT.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_2_testComputeStatsSmallintFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int16_t>({static_cast<int16_t>(-12345),
+                               static_cast<int16_t>(0),
+                               static_cast<int16_t>(12345)}),
+  };
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "SMALLINT FlatVector must be supported after PA-6.2 GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int16_t>(), static_cast<int16_t>(-12345));
+  EXPECT_EQ(stats[0].upperBound.value<int16_t>(), static_cast<int16_t>(12345));
+}
+
+// PA-6.2.A.3 RED: TINYINT (int8) FlatVector min/max scan.
+// Spark ByteType -> Velox TypeKind::TINYINT.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_3_testComputeStatsTinyintFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<int8_t>({static_cast<int8_t>(-128),
+                              static_cast<int8_t>(0),
+                              static_cast<int8_t>(127)}),
+  };
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "TINYINT FlatVector must be supported after PA-6.2 GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<int8_t>(), static_cast<int8_t>(-128));
+  EXPECT_EQ(stats[0].upperBound.value<int8_t>(), static_cast<int8_t>(127));
+}
+
 } // namespace gluten
