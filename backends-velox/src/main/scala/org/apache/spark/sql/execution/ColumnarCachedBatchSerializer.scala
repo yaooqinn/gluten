@@ -416,6 +416,11 @@ object CachedColumnarBatchKryoSerializer {
             // crashing; the row keeps the slot null so the caller treats it as supported=false.
             buf.get(new Array[Byte](lowerLen))
             val upperSkipLen = buf.getInt
+            require(
+              upperSkipLen >= 0 && upperSkipLen <= STRING_BOUND_TRUNCATE_LEN,
+              s"unknown-arm upperSkipLen=$upperSkipLen out of range " +
+                s"[0, $STRING_BOUND_TRUNCATE_LEN] (likely cpp/JVM wire mismatch)"
+            )
             buf.get(new Array[Byte](upperSkipLen))
         }
       }
