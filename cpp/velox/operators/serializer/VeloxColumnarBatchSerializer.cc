@@ -103,6 +103,11 @@ namespace {
 // Per-type FlatVector min/max scan + NaN guard. Returns false when the column must be marked
 // unsupported (any NaN observed for floating-point types -- Spark equality NaN != NaN means
 // min/max-based pruning would silently drop matching rows).
+//
+// Floating-point edge cases that DO NOT poison the column:
+// - +/-Infinity: ordered (-Inf < x < +Inf for finite x); participate in min/max normally.
+// - +0 and -0: IEEE 754 declares them equal under <, ==; min/max bound is correct either way.
+// - subnormal (denormal) values: ordered like normal floats; no special handling needed.
 template <typename T>
 bool scanMinMax(
     const facebook::velox::FlatVector<T>* flat,

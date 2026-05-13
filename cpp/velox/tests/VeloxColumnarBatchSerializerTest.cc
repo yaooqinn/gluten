@@ -133,6 +133,48 @@ TEST_F(VeloxColumnarBatchSerializerTest, computeStatsNaNRealPartitionPoisons) {
   }
 }
 
+// Float / double boundary values (+/-Inf, +/-0, subnormal) must NOT poison the column the way
+// NaN does -- they are ordered under IEEE 754 < and so produce well-defined min/max bounds.
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsFloatBoundaryValuesNotPoisoned) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  const float negInf = -std::numeric_limits<float>::infinity();
+  const float posInf = std::numeric_limits<float>::infinity();
+  const float subnormal = std::numeric_limits<float>::denorm_min();
+
+  // (a) REAL: -Inf / +Inf / +0 / -0 / subnormal mixed -- must be supported with [-Inf, +Inf].
+  {
+    std::vector<VectorPtr> children = {
+        makeFlatVector<float>({negInf, +0.0f, -0.0f, subnormal, posInf}),
+    };
+    auto vector = makeRowVector(children);
+    auto stats = serializer->computeStats(vector);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_TRUE(stats[0].hasLowerBound) << "boundary-value REAL column must be supported";
+    EXPECT_TRUE(stats[0].hasUpperBound);
+    EXPECT_EQ(stats[0].lowerBound.value<float>(), negInf);
+    EXPECT_EQ(stats[0].upperBound.value<float>(), posInf);
+  }
+
+  // (b) DOUBLE: same set, exercise the 8-byte path.
+  {
+    const double dNegInf = -std::numeric_limits<double>::infinity();
+    const double dPosInf = std::numeric_limits<double>::infinity();
+    const double dSubnormal = std::numeric_limits<double>::denorm_min();
+    std::vector<VectorPtr> children = {
+        makeFlatVector<double>({dNegInf, +0.0, -0.0, dSubnormal, dPosInf}),
+    };
+    auto vector = makeRowVector(children);
+    auto stats = serializer->computeStats(vector);
+    ASSERT_EQ(stats.size(), 1u);
+    EXPECT_TRUE(stats[0].hasLowerBound) << "boundary-value DOUBLE column must be supported";
+    EXPECT_TRUE(stats[0].hasUpperBound);
+    EXPECT_EQ(stats[0].lowerBound.value<double>(), dNegInf);
+    EXPECT_EQ(stats[0].upperBound.value<double>(), dPosInf);
+  }
+}
+
 // HUGEINT (int128) FlatVector for LongDecimal(20, 4): values [100, -50, 9999]
 // -> lo=-50, hi=9999.
 TEST_F(VeloxColumnarBatchSerializerTest, computeStatsHugeintDecimalFlatVector) {
