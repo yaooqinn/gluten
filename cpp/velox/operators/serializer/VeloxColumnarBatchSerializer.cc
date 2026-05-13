@@ -258,6 +258,25 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
+      case TypeKind::TIMESTAMP: {
+        // PA-6.2.E: Velox Timestamp struct {seconds, nanos} has defaulted
+        // operator<=> (Timestamp.h:377-378), so scanMinMax<Timestamp>
+        // compiles via the existing template. Variant<Timestamp> is a
+        // first-class scalar (Variant.h:259). Wire emit converts via
+        // Timestamp::toMicros() to int64 microseconds, sharing the JVM
+        // LongType 8B path (Spark TimestampType / TimestampNTZType
+        // physical = Long microseconds).
+        auto* flat = child->asFlatVector<Timestamp>();
+        Timestamp lo, hi;
+        supported = scanMinMax<Timestamp>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          stats.lowerBound = variant(lo);
+          stats.upperBound = variant(hi);
+        }
+        break;
+      }
       default:
         // Other types deferred to later micro-slices (Integer / Double / String /
         // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
@@ -312,7 +331,8 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::HUGEINT ||
          kind == facebook::velox::TypeKind::REAL ||
          kind == facebook::velox::TypeKind::DOUBLE ||
-         kind == facebook::velox::TypeKind::BOOLEAN);
+         kind == facebook::velox::TypeKind::BOOLEAN ||
+         kind == facebook::velox::TypeKind::TIMESTAMP);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     pushU32(numRows);  // PA-6.5 B3 (corrected post-Layer-2 #2): vanilla
@@ -398,6 +418,17 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushU8(s.lowerBound.value<bool>() ? 1 : 0);
           pushU32(1);
           pushU8(s.upperBound.value<bool>() ? 1 : 0);
+          break;
+        }
+        case facebook::velox::TypeKind::TIMESTAMP: {
+          // PA-6.2.E: emit as 8B LE int64 microseconds. Spark TimestampType /
+          // TimestampNTZType physical = Long us; this shares the JVM LongType
+          // 8B wire arm with no JVM-side changes (LongType isDispatchable +
+          // serialize/deserialize already accept Timestamp/TimestampNTZ).
+          pushU32(8);
+          pushI64LE(s.lowerBound.value<facebook::velox::Timestamp>().toMicros());
+          pushU32(8);
+          pushI64LE(s.upperBound.value<facebook::velox::Timestamp>().toMicros());
           break;
         }
         default:

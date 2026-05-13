@@ -412,4 +412,80 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_A_3_testComputeStatsTinyintFlatV
   EXPECT_EQ(stats[0].upperBound.value<int8_t>(), static_cast<int8_t>(127));
 }
 
+// PA-6.2.E RED: TIMESTAMP FlatVector min/max scan.
+// Spark TimestampType / TimestampNTZType physically = Long microseconds since epoch.
+// Velox Timestamp is a struct{int64_t seconds, uint64_t nanos} with defaulted
+// operator<=> (Timestamp.h:377-378), so scanMinMax<Timestamp> compiles via
+// existing template. Variant<Timestamp> is first-class
+// (Variant.h:259, VELOX_VARIANT_SCALAR_CONSTRUCTOR(TIMESTAMP)).
+// JVM marshal already lands in PA-6 (LongType path); cpp emit converts via
+// Timestamp::toMicros() -> int64_t for wire compatibility.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_testComputeStatsTimestampFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // Three timestamps chosen so min and max are distinct and order-clear:
+  //   t1 = 2000-01-01T00:00:00 (sec= 946684800, nanos=0)
+  //   t2 = 2024-01-01T00:00:00 (sec=1704067200, nanos=0)
+  //   t3 = 2026-05-13T00:00:00 (sec=1778198400, nanos=0)
+  Timestamp t1(946684800, 0);
+  Timestamp t2(1704067200, 0);
+  Timestamp t3(1778198400, 0);
+  std::vector<VectorPtr> children = {makeFlatVector<Timestamp>({t2, t1, t3})};
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "TIMESTAMP FlatVector must be supported after PA-6.2.E GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<Timestamp>(), t1);
+  EXPECT_EQ(stats[0].upperBound.value<Timestamp>(), t3);
+  EXPECT_EQ(stats[0].nullCount, 0);
+}
+
+// PA-6.2.E.2 RED: TIMESTAMP wire marshaling via framedSerializeWithStats.
+// Wire shape: lowerLen=8, payload = LE int64 microseconds (matches JVM
+// LongType path), aligning Spark TimestampType physical = Long us.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_2_testFramedSerializeWithStatsTimestamp) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  Timestamp t1(946684800, 0);   // 2000-01-01
+  Timestamp t3(1778198400, 0);  // 2026-05-13
+  std::vector<VectorPtr> children = {makeFlatVector<Timestamp>({t1, t3})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  // Skip MAGIC (4) + statsLen (4); statsBlob starts at offset 8.
+  // statsBlob = [numCols u32 LE | supported u8 | nullCount u32 | count u32 |
+  //              sizeInBytes u64 | lowerLen u32 LE | lower bytes |
+  //              upperLen u32 LE | upper bytes]
+  ASSERT_GE(framed.size(), 8u);
+  const uint8_t* p = framed.data() + 8;
+  // numCols
+  EXPECT_EQ(p[0], 1u);
+  EXPECT_EQ(p[1], 0u);
+  EXPECT_EQ(p[2], 0u);
+  EXPECT_EQ(p[3], 0u);
+  p += 4;
+  // supported
+  EXPECT_EQ(p[0], 1u) << "TIMESTAMP column should emit supported=1";
+  p += 1;
+  // nullCount + count + sizeInBytes
+  p += 4 + 4 + 8;
+  // lowerLen must be 8 (microseconds Long), matching JVM LongType path.
+  uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(lowerLen, 8u) << "TIMESTAMP wire lowerLen must be 8B (microseconds)";
+  p += 4;
+  // Read int64 LE microseconds; expect t1.toMicros().
+  int64_t loMicros = 0;
+  for (int i = 0; i < 8; ++i) {
+    loMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
+  }
+  EXPECT_EQ(loMicros, t1.toMicros())
+      << "TIMESTAMP wire lowerBound microseconds mismatch";
+}
+
 } // namespace gluten
