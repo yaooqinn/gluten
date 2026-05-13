@@ -39,11 +39,10 @@ public class ColumnarBatchSerializerJniWrapper implements RuntimeAware {
 
   public native JniUnsafeByteBuffer serialize(long handle);
 
-  // PA-2.5c: framed [magic | statsLen | statsBlob | bytesLen | bytesBlob] payload
-  // produced by VeloxColumnarBatchSerializer::framedSerializeWithStats. Returns
-  // a byte[] (not JniUnsafeByteBuffer) because the framed wire format is small
-  // enough that the simpler return type avoids ByteBuffer lifetime concerns;
-  // PA-3 will parse this on the JVM side. Layout in todos/0003 sec 2.
+  // Framed [magic | statsLen | statsBlob | bytesLen | bytesBlob] payload produced by
+  // VeloxColumnarBatchSerializer::framedSerializeWithStats. Returns byte[] (not
+  // JniUnsafeByteBuffer) because the framed wire is small enough that the simpler return type
+  // avoids ByteBuffer lifetime concerns.
   public native byte[] serializeWithStats(long handle);
 
   // Return the native ColumnarBatchSerializer handle
@@ -56,14 +55,11 @@ public class ColumnarBatchSerializerJniWrapper implements RuntimeAware {
 
   public native void close(long serializerHandle);
 
-  // PA-2.6: capability check for the serializeWithStats JNI extension. Users
-  // may pair a newer Gluten jar with an older libgluten.so that lacks this
-  // symbol; PA-3's write path consults this helper and falls back to the
-  // legacy serialize() when false. Probing is lazy (one-shot, cached) and
-  // catches UnsatisfiedLinkError without surfacing it -- a true probe call
-  // requires a real ColumnarBatch handle, so we instead reflect on the
-  // declared native method (if reflection finds it AND the cpp symbol is
-  // present in libgluten.so the helper returns true).
+  // Capability check for the serializeWithStats JNI extension. A new Gluten jar paired with an
+  // older libgluten.so may lack this symbol; the cache write path consults this helper and
+  // falls back to the legacy serialize() when false. Probing is lazy and one-shot: reflection
+  // on the declared native method proves the JVM side is wired (the cpp symbol is verified at
+  // first real invocation; callers must catch UnsatisfiedLinkError there too).
   private static volatile Boolean supportsStatsExtCached = null;
 
   public static boolean supportsStatsExt() {
@@ -73,10 +69,6 @@ public class ColumnarBatchSerializerJniWrapper implements RuntimeAware {
     }
     boolean result;
     try {
-      // Reflect on our own native method declaration; presence proves the JVM
-      // side is wired. The cpp side symbol is verified at first real invocation
-      // via JNI (the linker resolves on first call -- a stale .so will raise
-      // UnsatisfiedLinkError there, which PA-3 write path must also catch).
       ColumnarBatchSerializerJniWrapper.class.getDeclaredMethod("serializeWithStats", long.class);
       result = true;
     } catch (NoSuchMethodException e) {
