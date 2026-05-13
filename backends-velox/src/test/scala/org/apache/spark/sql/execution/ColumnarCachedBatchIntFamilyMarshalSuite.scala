@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.types.{IntegerType, LongType, ShortType, StructField, StructType}
+import org.apache.spark.sql.types.{ByteType, IntegerType, LongType, ShortType, StructField, StructType}
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -80,5 +80,27 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getShort(0) == lo, s"lower: expected $lo got ${read.getShort(0)}")
     assert(read.getShort(1) == hi, s"upper: expected $hi got ${read.getShort(1)}")
     assert(read.getInt(3) == 200, "count roundtrip")
+  }
+
+  // PA-6.C RED expected: ByteType not in dispatch -> UnsupportedOperationException.
+  // GREEN: serializeStats + deserializeStats add ByteType branch writing 1 byte.
+  test("PA-6.C TINYINT round-trip 1B preserves value (incl negative)") {
+    val lo: java.lang.Byte = Byte.box((-128).toByte)
+    val hi: java.lang.Byte = Byte.box(127.toByte)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 50, 50L))
+    val schema = StructType(
+      Seq(
+        StructField("k.lowerBound", ByteType, nullable = true),
+        StructField("k.upperBound", ByteType, nullable = true),
+        StructField("k.nullCount", IntegerType, nullable = false),
+        StructField("k.count", IntegerType, nullable = false),
+        StructField("k.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getByte(0) == lo, s"lower: expected $lo got ${read.getByte(0)}")
+    assert(read.getByte(1) == hi, s"upper: expected $hi got ${read.getByte(1)}")
+    assert(read.getInt(3) == 50, "count roundtrip")
   }
 }

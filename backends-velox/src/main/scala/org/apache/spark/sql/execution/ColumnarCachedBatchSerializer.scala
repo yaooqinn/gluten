@@ -320,6 +320,12 @@ object CachedColumnarBatchKryoSerializer {
             writeU16LE(baos, stats.getShort(base) & 0xffff)
             writeU32LE(baos, 2)
             writeU16LE(baos, stats.getShort(base + 1) & 0xffff)
+          case org.apache.spark.sql.types.ByteType =>
+            // 1 byte, signed.
+            writeU32LE(baos, 1)
+            baos.write(stats.getByte(base) & 0xff)
+            writeU32LE(baos, 1)
+            baos.write(stats.getByte(base + 1) & 0xff)
           case org.apache.spark.sql.types.LongType =>
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base))
@@ -382,6 +388,16 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 2,
               s"PA-6.B ShortType expects 2-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getShort)
+          case org.apache.spark.sql.types.ByteType =>
+            require(
+              lowerLen == 1,
+              s"PA-6.C ByteType expects 1-byte lowerBound, got $lowerLen")
+            row.update(base, buf.get)
+            val upperLen = buf.getInt
+            require(
+              upperLen == 1,
+              s"PA-6.C ByteType expects 1-byte upperBound, got $upperLen")
+            row.update(base + 1, buf.get)
           case org.apache.spark.sql.types.LongType =>
             require(
               lowerLen == 8,
