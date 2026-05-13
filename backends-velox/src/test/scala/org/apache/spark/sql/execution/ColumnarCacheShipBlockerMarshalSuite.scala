@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.types.{Decimal, DecimalType}
+import org.apache.spark.sql.types.{Decimal, DecimalType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
 
 import org.scalatest.funsuite.AnyFunSuite
@@ -41,17 +41,19 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
 
-  // PA-5.C ship blocker (NB3): Decimal(10, 2) -- precision <= 18 uses Long
-  // backing in Spark. If a future marshal naively casts to Long, scale is lost
-  // and downstream prune compares wrong magnitudes.
-  // Trigger: when cpp marshals Decimal min/max, this MUST pass.
-  ignore("PA-5.C Decimal(10, 2) round-trip preserves value (follow-up PR acceptance)") {
+  // PA-7 (was PA-5.C): Decimal(10, 2) -- precision <= 18 uses Long backing
+  // in Spark. JVM dispatch marshals 8B unscaled Long; cpp emits Velox BIGINT
+  // physical for short-decimal which round-trips through the LongType wire
+  // path. Schema arg supplies DecimalType(p,s) so deserializeStats can
+  // reconstruct Decimal from unscaled Long.
+  test("PA-7 Decimal(10, 2) round-trip preserves value") {
     val lo = Decimal(BigDecimal("1.50"), 10, 2)
     val hi = Decimal(BigDecimal("99.99"), 10, 2)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 800L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
+    val schema = StructType(Seq(StructField("d", DecimalType(10, 2))))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
     val dt = DecimalType(10, 2)
     val readLo = read.get(0, dt)
     val readHi = read.get(1, dt)

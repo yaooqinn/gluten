@@ -322,6 +322,9 @@ object CachedColumnarBatchKryoSerializer {
           | _: org.apache.spark.sql.types.DayTimeIntervalType
           | org.apache.spark.sql.types.TimestampType
           | org.apache.spark.sql.types.TimestampNTZType => true
+      // PA-7: short-decimal (p<=18) uses Long unscaled backing; long-decimal
+      // (p>18) lands in PA-8 with int128 path.
+      case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 => true
       case _ => false
     }
 
@@ -405,6 +408,14 @@ object CachedColumnarBatchKryoSerializer {
             writeI64LE(baos, stats.getLong(base))
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base + 1))
+          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 =>
+            // PA-7: short-Decimal stored as org.apache.spark.sql.types.Decimal
+            // in stats; toUnscaledLong() is the Long unscaled value (matches
+            // Velox short-decimal physical = BIGINT). Marshal 8 LE bytes.
+            writeU32LE(baos, 8)
+            writeI64LE(baos, stats.getDecimal(base, d.precision, d.scale).toUnscaledLong)
+            writeU32LE(baos, 8)
+            writeI64LE(baos, stats.getDecimal(base + 1, d.precision, d.scale).toUnscaledLong)
           case other =>
             throw new UnsupportedOperationException(
               s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
@@ -487,6 +498,21 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 8,
               s"PA-3.2/E/G Long-family expects 8-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getLong)
+          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 =>
+            // PA-7: read 8B unscaled Long, reconstruct Decimal(unscaled, p, s).
+            // T1 trap: must wrap as Decimal, NOT raw Long, or
+            // SpecificInternalRow.getDecimal ClassCastException at codegen.
+            require(
+              lowerLen == 8,
+              s"PA-7 short-Decimal expects 8-byte lowerBound, got $lowerLen")
+            row.update(base, org.apache.spark.sql.types.Decimal(buf.getLong, d.precision, d.scale))
+            val upperLen = buf.getInt
+            require(
+              upperLen == 8,
+              s"PA-7 short-Decimal expects 8-byte upperBound, got $upperLen")
+            row.update(
+              base + 1,
+              org.apache.spark.sql.types.Decimal(buf.getLong, d.precision, d.scale))
           case other =>
             // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
             // BIGINT physical) or other types not yet in JVM dispatch.
