@@ -559,4 +559,90 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_9_2_testFramedSerializeWithStatsVarc
   EXPECT_EQ(upper, "banana") << "VARCHAR upperBound bytes mismatch";
 }
 
+// CB-1 RED: TIMESTAMP with sub-microsecond nanos must NOT silently floor
+// the upper bound (which would shrink prune interval and false-negative
+// drop ns!=0 rows). cpp emit must use floor(lo) and ceil(hi) so the
+// statsBlob window is a CONSERVATIVE WIDENING of the true [lo, hi].
+// Velox/Timestamp.h:183 toMicros() = seconds * 1e6 + nanos / 1000 (integer
+// floor); we must compensate on hi.
+TEST_F(VeloxColumnarBatchSerializerTest, CB_1_testTimestampNanosCeilUpperFloorLower) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // Pick boundary nanos:
+  //   lo = (s, 500)        -> raw us = s*1e6, nanos%1000=500 (truncated)
+  //                           expected wire lower = floor = s*1e6
+  //   hi = (s, 999'500)    -> raw us = s*1e6+999, nanos%1000=500 (truncated)
+  //                           expected wire upper = ceil = s*1e6+999+1 = s*1e6+1000
+  // If we naively call toMicros for hi, we get s*1e6+999 which is LESS than
+  // the true value -> bug.
+  const int64_t s = 1704067200;  // 2024-01-01T00:00:00Z
+  Timestamp lo(s, 500);
+  Timestamp hi(s, 999'500);
+  std::vector<VectorPtr> children = {makeFlatVector<Timestamp>({lo, hi})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  ASSERT_GE(framed.size(), 8u);
+  const uint8_t* p = framed.data() + 8;  // skip MAGIC + statsLen
+  EXPECT_EQ(p[0], 1u);  // numCols=1
+  p += 4;
+  EXPECT_EQ(p[0], 1u) << "TIMESTAMP nanos column should still emit supported=1";
+  p += 1 + 4 + 4 + 8;  // skip supported + nullCount + count + sizeInBytes
+
+  // lower: lowerLen=8, payload = floor lo = s*1e6
+  uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(lowerLen, 8u);
+  p += 4;
+  int64_t loMicros = 0;
+  for (int i = 0; i < 8; ++i) {
+    loMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
+  }
+  const int64_t expectedLo = s * 1'000'000LL;
+  EXPECT_EQ(loMicros, expectedLo)
+      << "CB-1: lower must be floor(lo). Got " << loMicros << ", want " << expectedLo;
+  p += 8;
+
+  // upper: upperLen=8, payload = ceil hi = s*1e6 + 1000 (NOT s*1e6+999)
+  uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(upperLen, 8u);
+  p += 4;
+  int64_t hiMicros = 0;
+  for (int i = 0; i < 8; ++i) {
+    hiMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
+  }
+  const int64_t expectedHi = s * 1'000'000LL + 1000;  // ceil to next us
+  EXPECT_EQ(hiMicros, expectedHi)
+      << "CB-1: upper must be ceil(hi) when nanos%1000 != 0. Got "
+      << hiMicros << ", want " << expectedHi;
+}
+
+// CB-1.2 RED: when nanos % 1000 == 0 (exact us), no ceil adjustment needed.
+TEST_F(VeloxColumnarBatchSerializerTest, CB_1_2_testTimestampExactMicrosNoCeil) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  const int64_t s = 1704067200;
+  Timestamp lo(s, 0);
+  Timestamp hi(s, 1'000);  // exactly 1 us
+  std::vector<VectorPtr> children = {makeFlatVector<Timestamp>({lo, hi})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  const uint8_t* p = framed.data() + 8;
+  p += 4 + 1 + 4 + 4 + 8 + 4;  // numCols + supported + n/c/sz + lowerLen
+  int64_t loMicros = 0;
+  for (int i = 0; i < 8; ++i) loMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
+  EXPECT_EQ(loMicros, s * 1'000'000LL);
+  p += 8 + 4;  // lower bytes + upperLen
+  int64_t hiMicros = 0;
+  for (int i = 0; i < 8; ++i) hiMicros |= (static_cast<int64_t>(p[i]) << (8 * i));
+  EXPECT_EQ(hiMicros, s * 1'000'000LL + 1)
+      << "CB-1.2: upper exact us should NOT ceil-adjust beyond toMicros";
+}
+
 } // namespace gluten

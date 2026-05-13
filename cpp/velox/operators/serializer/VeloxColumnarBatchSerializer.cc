@@ -444,14 +444,33 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           break;
         }
         case facebook::velox::TypeKind::TIMESTAMP: {
-          // PA-6.2.E: emit as 8B LE int64 microseconds. Spark TimestampType /
-          // TimestampNTZType physical = Long us; this shares the JVM LongType
-          // 8B wire arm with no JVM-side changes (LongType isDispatchable +
-          // serialize/deserialize already accept Timestamp/TimestampNTZ).
+          // PA-6.2.E + CB-1: emit as 8B LE int64 microseconds. Spark
+          // TimestampType / TimestampNTZType physical = Long us; this
+          // shares the JVM LongType 8B wire arm with no JVM-side changes.
+          //
+          // CB-1 (Layer 2 mid-review #3 BLOCKER): Velox/Timestamp.h:183
+          // toMicros() = seconds * 1e6 + nanos / 1000 (integer floor).
+          // Naive use floors BOTH lo and hi. Floor on lo is OK (widens
+          // the prune interval downward, conservative). Floor on hi
+          // SHRINKS the prune interval and can false-negative drop rows
+          // whose true timestamp has nanos%1000 != 0.
+          //
+          // Fix: floor(lo), ceil(hi). ceil = floor + 1 us when there is
+          // any sub-microsecond residue (nanos % 1000 != 0).
+          const auto& loTs = s.lowerBound.value<facebook::velox::Timestamp>();
+          const auto& hiTs = s.upperBound.value<facebook::velox::Timestamp>();
+          int64_t loMicros = loTs.toMicros();  // floor toward -inf is safe for lo
+          int64_t hiMicros = hiTs.toMicros();
+          if (hiTs.getNanos() % 1000 != 0) {
+            // Conservative ceil: widen hi to next us boundary so the prune
+            // window covers the true value. (toMicros may throw on overflow,
+            // but +1 here cannot overflow since toMicros already validated.)
+            hiMicros += 1;
+          }
           pushU32(8);
-          pushI64LE(s.lowerBound.value<facebook::velox::Timestamp>().toMicros());
+          pushI64LE(loMicros);
           pushU32(8);
-          pushI64LE(s.upperBound.value<facebook::velox::Timestamp>().toMicros());
+          pushI64LE(hiMicros);
           break;
         }
         case facebook::velox::TypeKind::VARCHAR: {
