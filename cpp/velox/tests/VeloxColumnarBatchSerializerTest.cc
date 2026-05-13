@@ -645,4 +645,113 @@ TEST_F(VeloxColumnarBatchSerializerTest, CB_1_2_testTimestampExactMicrosNoCeil) 
       << "CB-1.2: upper exact us should NOT ceil-adjust beyond toMicros";
 }
 
+// CB-2 RED: VARCHAR cpp must truncate to 256B at source (single source of
+// truth, removing JVM-side carry-overflow + truncate as the only authority
+// and aligning vanilla-parity story). Layer 2 mid-review #3 BLOCKER
+// (PMC#2 + skeptic SB-5 + perf#5 cross-persona consensus).
+TEST_F(VeloxColumnarBatchSerializerTest, CB_2_testVarcharCppTruncates256B) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // Build single-row vectors with 300-byte 'a' (lo) and 300-byte 'm' (hi).
+  // After cpp truncate to 256B + carry on hi, expect:
+  //   lo = 256B 'a'  (prefix property: prefix <= original byte-wise)
+  //   hi = 255B 'm' + 1B 'n'  (carry +1 on last byte)
+  std::string longA(300, 'a');
+  std::string longM(300, 'm');
+  // makeFlatVector<StringView> with two rows so one becomes lo, the other hi.
+  std::vector<VectorPtr> children = {makeFlatVector<StringView>(
+      {StringView(longA.data(), longA.size()),
+       StringView(longM.data(), longM.size())})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  ASSERT_GE(framed.size(), 8u);
+  const uint8_t* p = framed.data() + 8;
+  EXPECT_EQ(p[0], 1u);  // numCols
+  p += 4;
+  EXPECT_EQ(p[0], 1u) << "CB-2: column should still be supported=1 after cpp truncate";
+  p += 1 + 4 + 4 + 8;  // skip supported + nullCount + count + sizeInBytes
+
+  // lower: 256B prefix of 'a'
+  uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(lowerLen, 256u) << "CB-2: cpp must truncate lower to 256B";
+  p += 4;
+  for (uint32_t i = 0; i < 256u; ++i) {
+    if (p[i] != 'a') {
+      ADD_FAILURE() << "CB-2 lower byte " << i << " = " << static_cast<int>(p[i])
+                    << ", expected 'a'";
+      break;
+    }
+  }
+  p += 256;
+
+  // upper: 255B 'm' + 1B 'n' (carry)
+  uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(upperLen, 256u) << "CB-2: cpp must truncate upper to 256B";
+  p += 4;
+  for (uint32_t i = 0; i < 255u; ++i) {
+    if (p[i] != 'm') {
+      ADD_FAILURE() << "CB-2 upper byte " << i << " = " << static_cast<int>(p[i])
+                    << ", expected 'm'";
+      break;
+    }
+  }
+  EXPECT_EQ(p[255], 'n')
+      << "CB-2: upper last byte should be 'm'+1='n' (carry), got " << static_cast<int>(p[255]);
+}
+
+// CB-2.2 RED: when upper bound is 256B all-0xFF prefix, carry overflows
+// past byte 0 and we cannot form a safe upper-bound widening. cpp must
+// demote supported=0.
+TEST_F(VeloxColumnarBatchSerializerTest, CB_2_2_testVarcharCppCarryOverflowDemote) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::string longLo(10, '\xff');
+  std::string longHi(300, '\xff');
+  std::vector<VectorPtr> children = {makeFlatVector<StringView>(
+      {StringView(longLo.data(), longLo.size()),
+       StringView(longHi.data(), longHi.size())})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  const uint8_t* p = framed.data() + 8;
+  p += 4;  // numCols
+  EXPECT_EQ(p[0], 0u)
+      << "CB-2.2: 300x 0xFF upper must demote to supported=0 (carry overflow)";
+}
+
+// CB-2.3 GREEN regression: short string (<= 256B) round-trips identically
+// after the cpp-truncate change. Guards against the new code path
+// accidentally rewriting short-string bytes.
+TEST_F(VeloxColumnarBatchSerializerTest, CB_2_3_testVarcharShortStringIntact) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {makeFlatVector<StringView>(
+      {StringView("apple"), StringView("banana")})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  const uint8_t* p = framed.data() + 8;
+  p += 4 + 1 + 4 + 4 + 8;  // numCols + supported + n/c/sz
+  uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(lowerLen, 5u) << "CB-2.3: short lower bytes intact (no truncate)";
+  p += 4;
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 5), "apple");
+  p += 5;
+  uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(upperLen, 6u) << "CB-2.3: short upper bytes intact (no truncate, no carry)";
+  p += 4;
+  EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 6), "banana");
+}
+
 } // namespace gluten

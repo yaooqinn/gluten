@@ -278,24 +278,57 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::VARCHAR: {
-        // PA-9: VARCHAR scan via StringView. StringView::operator<=>
+        // PA-9 + CB-2: VARCHAR scan via StringView. StringView::operator<=>
         // (StringView.h:219) uses memcmp -> unsigned byte ordering, matching
         // Spark ByteArray.compareBinary which uses Byte.toUnsignedInt + 0xFF
-        // (ByteArray.java). variant(std::string{sv}) heap-allocates and owns
-        // the bytes (Variant.h:232), so the StringView's pointer-into-
-        // FlatVector-buffer lifetime is not a concern after computeStats
-        // returns. cpp does NOT truncate -- JVM PA-9 truncates to 256B on
-        // read with carry-overflow demote (design 0008 sec 3.1).
+        // (ByteArray.java). variant(std::string{sv}) heap-allocates owned
+        // string (Variant.h:232) so post-computeStats lifetime is decoupled
+        // from RowVector buffer.
+        //
+        // CB-2 (Layer 2 mid-review #3 BLOCKER): cpp truncates to 256B at
+        // SOURCE so JVM never sees > 256B (single source of truth, vanilla
+        // parity gap explicit, JNI wire bytes capped). lower truncate is
+        // monotonic <= original by prefix property; upper requires +1 carry
+        // (carry-overflow on all-0xFF prefix demotes supported=0). Mirrors
+        // JVM PA-9 encodeStringBounds; design 0008 sec 3.1 declares the
+        // common contract.
+        constexpr size_t kStatsStringTruncateLen = 256;
         auto* flat = child->asFlatVector<StringView>();
         StringView lo, hi;
         supported = scanMinMax<StringView>(flat, lo, hi, nullCnt, seen);
         if (supported && seen) {
-          stats.hasLowerBound = true;
-          stats.hasUpperBound = true;
-          // Force std::string copy to own the bytes; std::string ctor
-          // takes (const char*, size_t).
-          stats.lowerBound = variant(std::string(lo.data(), lo.size()));
-          stats.upperBound = variant(std::string(hi.data(), hi.size()));
+          // Lower bound: take prefix; prefix-property guarantees <= original.
+          const size_t loLen = std::min(static_cast<size_t>(lo.size()), kStatsStringTruncateLen);
+          std::string loBytes(lo.data(), loLen);
+          // Upper bound: take prefix; if truncated, +1 carry on last byte
+          // so encoded >= original byte-wise. Carry overflow (all-0xFF
+          // prefix) cannot widen -> demote.
+          const size_t hiSrcLen = static_cast<size_t>(hi.size());
+          std::string hiBytes(hi.data(), std::min(hiSrcLen, kStatsStringTruncateLen));
+          bool hiOk = true;
+          if (hiSrcLen > kStatsStringTruncateLen) {
+            // Apply +1 carry from the rightmost byte.
+            bool carryDone = false;
+            for (int i = static_cast<int>(hiBytes.size()) - 1; i >= 0; --i) {
+              uint8_t b = static_cast<uint8_t>(hiBytes[i]) + 1;
+              if (b != 0) {
+                hiBytes[i] = static_cast<char>(b);
+                carryDone = true;
+                break;
+              }
+              hiBytes[i] = 0;
+            }
+            hiOk = carryDone;
+          }
+          if (hiOk) {
+            stats.hasLowerBound = true;
+            stats.hasUpperBound = true;
+            stats.lowerBound = variant(std::move(loBytes));
+            stats.upperBound = variant(std::move(hiBytes));
+          } else {
+            // Carry overflowed -> cannot form safe upper bound.
+            supported = false;
+          }
         }
         break;
       }
