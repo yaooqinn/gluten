@@ -302,4 +302,42 @@ class ColumnarCachedBatchE2ESuite
       df.unpersist()
     }
   }
+
+  // PA-6.2.E e2e Timestamp prune: TimestampType physically Long microseconds
+  // (Spark) -> Velox Timestamp struct{seconds, nanos}. cpp scanMinMax<Timestamp>
+  // GREEN in PA-6.2.E; emit converts via toMicros() to share JVM LongType 8B
+  // wire arm. This sentinel proves: (a) no crash on cache + filter, (b) correct
+  // result, (c) prune effective (numOutputRows <= 2 * (N/P)).
+  test("PA-6.2.E Timestamp column equality filter: prune via Long us stats (8B LE)") {
+    import org.apache.spark.sql.functions.{lit => sparkLit}
+    // Build N rows of distinct timestamps, one second apart starting at epoch
+    // 2024-01-01T00:00:00Z (= 1704067200 seconds). Pivot at second N/2.
+    val baseSec = 1704067200L
+    val cached = spark
+      .range(N)
+      .selectExpr(s"timestamp_seconds(${baseSec}L + id) as ts")
+      .repartitionByRange(P, col("ts"))
+      .cache()
+    try {
+      cached.count() // materialize -- triggers cpp TIMESTAMP computeStats path
+      val pivotTs = sparkLit(java.sql.Timestamp.from(
+        java.time.Instant.ofEpochSecond(baseSec + (N / 2))))
+      val df = cached.filter(col("ts") === pivotTs)
+      val result = df.count()
+      assert(result == 1L, s"expected exactly one row matching timestamp pivot, got $result")
+      val plan = df.queryExecution.executedPlan
+      val ims = find(plan) {
+        case _: InMemoryTableScanExec => true
+        case _ => false
+      }.get.asInstanceOf[InMemoryTableScanExec]
+      val outRows = ims.metrics("numOutputRows").value
+      val upperBound = (N / P) * 2
+      assert(
+        outRows <= upperBound,
+        s"numOutputRows=$outRows expected <= $upperBound (Timestamp prune ineffective)"
+      )
+    } finally {
+      cached.unpersist()
+    }
+  }
 }
