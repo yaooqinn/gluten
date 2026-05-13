@@ -555,17 +555,17 @@ object CachedColumnarBatchKryoSerializer {
   // - Upper: needs +1 carry on the truncated tail to ensure encoded >= original. If the carry
   //   propagates past byte 0 (all 256 prefix bytes were 0xFF), we cannot form a safe widening
   //   upper bound; return None so the caller demotes supported.
-  private val PA9_STRING_TRUNCATE_LEN = 256
+  private val STRING_BOUND_TRUNCATE_LEN = 256
   private def encodeStringBounds(
       loBytes: Array[Byte],
       hiBytes: Array[Byte]): Option[(Array[Byte], Array[Byte])] = {
-    val loLen = math.min(loBytes.length, PA9_STRING_TRUNCATE_LEN)
+    val loLen = math.min(loBytes.length, STRING_BOUND_TRUNCATE_LEN)
     val loEnc = Arrays.copyOf(loBytes, loLen)
-    if (hiBytes.length <= PA9_STRING_TRUNCATE_LEN) {
+    if (hiBytes.length <= STRING_BOUND_TRUNCATE_LEN) {
       Some((loEnc, Arrays.copyOf(hiBytes, hiBytes.length)))
     } else {
-      val hiEnc = Arrays.copyOf(hiBytes, PA9_STRING_TRUNCATE_LEN)
-      var i = PA9_STRING_TRUNCATE_LEN - 1
+      val hiEnc = Arrays.copyOf(hiBytes, STRING_BOUND_TRUNCATE_LEN)
+      var i = STRING_BOUND_TRUNCATE_LEN - 1
       while (i >= 0) {
         val b = (hiEnc(i) & 0xff) + 1
         if (b <= 0xff) {
