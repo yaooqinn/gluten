@@ -22,7 +22,7 @@ import org.apache.gluten.execution.VeloxWholeStageTransformerSuite
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.{InMemoryTableScanExec, SparkCacheUtil}
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.{col, lit, when}
 
 /**
  * PA-3.5 e2e smoke for Gluten in-memory cache stats (Layer A min/max).
@@ -135,6 +135,65 @@ class ColumnarCachedBatchE2ESuite
       )
     } finally {
       cached.unpersist()
+    }
+  }
+
+  // PA-5.A ship blocker (BL7): all-null Long column. partition that contains
+  // only nulls must NOT be incorrectly pruned by min/max stats (lower=upper=
+  // sentinel would silently drop the matching null row, but null comparison
+  // semantics mean WHERE col = 5 returns no rows ANYWAY -- the real risk is
+  // mishandling the all-null case during stats compute, leading to crash or
+  // wrong metadata. We assert: cache + filter on all-null column doesn't
+  // crash and returns the correct (empty) result.
+  test("PA-5.A all-null Long column: cache + equality filter no crash + correct result") {
+    val df = spark
+      .range(N)
+      .select(lit(null).cast("bigint").as("k"))
+      .repartition(P)
+      .cache()
+    try {
+      df.count() // materialize
+      val result = df.filter(col("k") === 5L).count()
+      assert(result == 0L, s"all-null col cannot match k=5, got $result")
+      // Sanity: cached count (pre-filter) is still N
+      assert(df.count() == N, s"all-null cached frame should still hold $N rows")
+    } finally {
+      df.unpersist()
+    }
+  }
+
+  // PA-5.B ship blocker (NB4): partition containing NaN Float must NOT have
+  // valid min/max bounds -- cpp poison guard sets supported=false on any NaN.
+  // If guard is missing, NaN propagates into stats and arbitrary partitions
+  // get silently pruned. Assert: WHERE col = 1.5 still returns the matching
+  // non-NaN row even when other rows in same partition are NaN.
+  // SCOPE NOTE: Layer A ships BIGINT-only stats; Float/Double marshal is
+  // phase-2. Initial run returned 0 rows (entire cache pruned), suggesting cpp
+  // either (a) silently treats Float as BIGINT and packs NaN bits as Long, or
+  // (b) ANSI-mode plan fallback breaks the cache hit. Investigation doc:
+  // todos/features/gluten-inmemory-cache-stats/investigations/0006-pa5b-float-nan-prune.md
+  // Trigger: when Float/Double marshal lands or NaN root cause is fixed.
+  ignore("PA-5.B Float NaN partition: filter on non-NaN not silently pruned (deferred)") {
+    val df = spark
+      .range(N)
+      .select(
+        when(col("id") === 7L, lit(Float.NaN))
+          .otherwise(col("id").cast("float"))
+          .as("k"))
+      .repartition(P)
+      .cache()
+    try {
+      df.count()
+      // pivot=42 is a non-NaN value that exists somewhere; the partition that
+      // contains it may also contain the NaN row at id=7 (collision possible
+      // depending on hash partitioning). Either way, equality must find it.
+      val result = df.filter(col("k") === 42.0f).count()
+      assert(
+        result == 1L,
+        s"expected 1 row with k=42.0, got $result " +
+          s"(NaN may have poisoned partition stats)")
+    } finally {
+      df.unpersist()
     }
   }
 }
