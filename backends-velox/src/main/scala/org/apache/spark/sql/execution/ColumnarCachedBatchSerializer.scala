@@ -228,81 +228,49 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
 }
 
 object CachedColumnarBatchKryoSerializer {
-  // V2_MAGIC = 0xFE 0xCA 0x53 0x02. Cannot collide with v1 binary because v1's
-  // first 4 bytes are numRows (Kryo fixed 4-byte BE) and any non-negative Int
-  // < 2^31 has BE high byte in [0x00, 0x7F]. Magic high byte 0xFE > 0x7F is
-  // structurally unreachable, so any v1 first byte is <= 0x7F < 0xFE -- disjoint.
+  // Magic bytes are chosen so the high byte (0xFE) cannot collide with V1's first byte:
+  // V1 starts with numRows as Kryo fixed 4-byte BE, whose high byte is in [0x00, 0x7F] for any
+  // non-negative Int < 2^31.
   val V2_MAGIC: Array[Byte] =
     Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x02.toByte)
-  // PA-6.5 D1: V3_MAGIC distinguishes the schema-tail-bearing layout from
-  // pre-PA-6.0 V2. Same disjointness from V1 (high byte 0xFE > 0x7F).
   val V3_MAGIC: Array[Byte] =
     Array[Byte](0xfe.toByte, 0xca.toByte, 0x53.toByte, 0x03.toByte)
 
-  // PA-3.2: statsBlob binary framing, aligned with cpp end
-  // (cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5b
-  // helper). Layout (LE throughout, no schemaVer prefix to match cpp):
+  // Per-column statsBlob layout (LE throughout, matches the cpp emitter in
+  // VeloxColumnarBatchSerializer.cc):
   //
-  //   [ numCols: uint32 LE ]
+  //   [ numCols: u32 ]
   //   per col:
-  //     [ supported: uint8 ]            // 1 if hasLower && hasUpper
-  //     [ nullCount: uint32 LE ]
-  //     [ count: uint32 LE ]
-  //     [ sizeInBytes: uint64 LE ]
+  //     [ supported: u8 ]
+  //     [ nullCount: u32 ]
+  //     [ count: u32 ]
+  //     [ sizeInBytes: u64 ]
   //     if supported:
-  //       [ lowerBoundLen: uint32 LE = 8 ]   // PA-3.2 v1: BIGINT only
-  //       [ lowerBound: int64 LE ]
-  //       [ upperBoundLen: uint32 LE = 8 ]
-  //       [ upperBound: int64 LE ]
+  //       [ lowerBoundLen: u32 ] [ lowerBound bytes ]
+  //       [ upperBoundLen: u32 ] [ upperBound bytes ]
   //
-  // PA-3.2 scope: BIGINT 1-col only (matches cpp PA-2.5b). Multi-col + other
-  // types land in PA-3.3 / PA-3.5 / follow-up. The vanilla
-  // SimpleMetricsCachedBatch.stats InternalRow layout is per-col 5 slots in
-  // order (lowerBound, upperBound, nullCount, count, sizeInBytes) per docs/0003
-  // sec 3 + investigations/0003 rev 2 evidence 2. PA-1 placeholder used 2
-  // slots; PA-3.2 + test update align with vanilla.
+  // The vanilla SimpleMetricsCachedBatch.stats InternalRow has 5 slots per source column in
+  // order (lowerBound, upperBound, nullCount, count, sizeInBytes).
   //
-  // PA-6.5 B2: dataType allowlist for dispatch table. Source columns whose
-  // dataType is NOT in this set are demoted to supported=0 in serializeStats,
-  // preventing cpp-emitted stats (e.g. short-Decimal as Velox BIGINT) from
-  // causing UnsupportedOperationException in JVM dispatch. Decimal/String/
-  // Bool/Float/Double/Timestamp/TimestampNTZ land in PA-7..PA-10.
+  // Source dataTypes outside this allowlist are demoted to supported=0 in serializeStats
+  // (the cpp side may still emit supported=1 for short-Decimal as Velox BIGINT; the JVM
+  // gate prevents UnsupportedOperationException in dispatch).
   private[execution] def isDispatchable(dt: DataType): Boolean =
     dt match {
-      case IntegerType
-          | DateType
-          | _: YearMonthIntervalType => true
+      case IntegerType | DateType | _: YearMonthIntervalType => true
       case ShortType => true
       case ByteType => true
-      case LongType
-          | _: DayTimeIntervalType
-          | TimestampType
-          | TimestampNTZType => true
-      // PA-7: short-decimal (p<=18) uses Long unscaled backing; long-decimal
-      // (p>18) lands in PA-8 with int128 path.
-      case d: DecimalType if d.precision <= 18 => true
-      // PA-8: long-decimal (p>18) uses BigInteger backing; marshal as 16B LE
-      // signed two's-complement. Velox short-vs-long boundary aligns at p=18
-      // (Spark) and physical TypeKind::HUGEINT.
-      case d: DecimalType if d.precision <= 38 => true
-      // PA-10: Float (4B IEEE 754) / Double (8B) / Boolean (1B). NaN guard
-      // lives in cpp scanMinMax (returns supported=false on first NaN).
-      case FloatType => true
-      case DoubleType => true
+      case LongType | _: DayTimeIntervalType | TimestampType | TimestampNTZType => true
+      case d: DecimalType if d.precision <= 18 => true // short-decimal: Long unscaled
+      case d: DecimalType if d.precision <= 38 => true // long-decimal: 16B LE int128
+      case FloatType => true // 4B IEEE 754; NaN guard in cpp scanMinMax
+      case DoubleType => true // 8B IEEE 754; NaN guard in cpp scanMinMax
       case BooleanType => true
-      // PA-9: variable-length UTF-8 bytes. Truncated to 256B on emit (design
-      // 0008 sec 3.1); reader is length-prefix driven so longer fallback widths
-      // (rare carry-overflow path) round-trip safely.
-      case StringType => true
+      case StringType => true // truncated to 256B; see encodeStringBounds
       case _ => false
     }
 
-  //
-  // PA-6.0: schema parameter added for full-type dispatch (D-A5). PA-6.0 itself
-  // remains BIGINT-only behavior (schema is unused inside); PA-6.A onwards adds
-  // per-column dataType dispatch reading the schema. schema may be null for
-  // legacy callsites that have not been updated; in that case we keep the
-  // PA-3.2 BIGINT-only behavior (backward compatible).
+  // schema may be null for legacy callsites; in that case behave as BIGINT-only (V2 read path).
   private[execution] def serializeStats(
       stats: InternalRow,
       schema: StructType): Array[Byte] = {
@@ -319,16 +287,10 @@ object CachedColumnarBatchKryoSerializer {
       val base = col * 5
       val hasLower = !stats.isNullAt(base)
       val hasUpper = !stats.isNullAt(base + 1)
-      // PA-6.5 B2: demote to unsupported for any dataType not yet in dispatch table
-      // (Decimal/String/Bool/Float/Double/Timestamp deferred to PA-7..PA-10). cpp may
-      // still emit supported=1 for short-Decimal (Velox physical=BIGINT); JVM-side
-      // gate prevents UOE crash.
       val dispatchable = (schema == null) ||
         CachedColumnarBatchKryoSerializer.isDispatchable(schema(col).dataType)
-      // PA-9: pre-compute String payload so an overflowing upper-bound carry
-      // can demote `supported` BEFORE the supported byte is written. Design
-      // 0008 sec 3.1: truncate to 256B, upper-bound +1 byte-wise carry; if carry
-      // overflows (all-0xFF prefix) the upper cannot widen, so we demote.
+      // For String, pre-compute the truncated payload so an all-0xFF carry overflow
+      // can demote `supported` *before* the supported byte is written.
       val isStringCol = (schema != null) && hasLower && hasUpper &&
         (schema(col).dataType eq StringType)
       val stringPayload: Option[(Array[Byte], Array[Byte])] =
@@ -344,64 +306,39 @@ object CachedColumnarBatchKryoSerializer {
       writeU32LE(baos, if (stats.isNullAt(base + 3)) 0 else stats.getInt(base + 3))
       writeU64LE(baos, if (stats.isNullAt(base + 4)) 0L else stats.getLong(base + 4))
       if (supported) {
-        // PA-6.A: dispatch by source-column dataType. PartitionStatistics.schema
-        // emits 5 fields per source column (lowerBound, upperBound, nullCount,
-        // count, sizeInBytes) where lowerBound/upperBound carry the SOURCE
-        // column dataType (see ~/spark/.../ColumnStats.scala line 25-32).
-        // schema==null => legacy BIGINT-only behavior (PA-3.2).
+        // schema==null => BIGINT-only legacy behavior. Otherwise dispatch by source dataType,
+        // matching vanilla ColumnBuilder's union for the integer / long families.
         val dt: DataType =
           if (schema == null) LongType else schema(col).dataType
         dt match {
-          case IntegerType
-              | DateType
-              | _: YearMonthIntervalType =>
-            // PA-6.A: 4 LE bytes signed Int.
-            // PA-6.G.1: DateType physically Int (days since epoch).
-            // PA-6.F.1: YearMonthIntervalType physically Int (months).
-            // Aligned with vanilla ColumnBuilder.scala line 187:
-            // `IntegerType | DateType | _: YearMonthIntervalType => IntColumnBuilder`.
+          case IntegerType | DateType | _: YearMonthIntervalType =>
             writeU32LE(baos, 4)
             writeU32LE(baos, stats.getInt(base))
             writeU32LE(baos, 4)
             writeU32LE(baos, stats.getInt(base + 1))
           case ShortType =>
-            // writeU16LE writes 2 LE bytes; signed Short has identical bit pattern.
             writeU32LE(baos, 2)
             writeU16LE(baos, stats.getShort(base) & 0xffff)
             writeU32LE(baos, 2)
             writeU16LE(baos, stats.getShort(base + 1) & 0xffff)
           case ByteType =>
-            // 1 byte, signed.
             writeU32LE(baos, 1)
             baos.write(stats.getByte(base) & 0xff)
             writeU32LE(baos, 1)
             baos.write(stats.getByte(base + 1) & 0xff)
-          case LongType
-              | TimestampType
-              | TimestampNTZType
-              | _: DayTimeIntervalType =>
-            // PA-3.2: 8 LE bytes signed Long.
-            // PA-6.G.2/3: TimestampType / TimestampNTZType physically Long microseconds.
-            // PA-6.F.2: DayTimeIntervalType physically Long microseconds.
-            // Aligned with vanilla ColumnBuilder.scala line 188.
-            // (TimeType deliberately omitted -- spark-4.1 may not expose it on
-            // this code path; revisit when PA-6.G.4 lands.)
+          case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base))
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base + 1))
           case d: DecimalType if d.precision <= 18 =>
-            // PA-7: short-Decimal stored as Decimal
-            // in stats; toUnscaledLong() is the Long unscaled value (matches
-            // Velox short-decimal physical = BIGINT). Marshal 8 LE bytes.
+            // short-Decimal: Long unscaled (matches Velox short-decimal physical = BIGINT).
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getDecimal(base, d.precision, d.scale).toUnscaledLong)
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getDecimal(base + 1, d.precision, d.scale).toUnscaledLong)
           case d: DecimalType if d.precision <= 38 =>
-            // PA-8: long-Decimal (p>18). Marshal 16B LE signed two's-complement
-            // unscaled BigInteger. Matches cpp HUGEINT int128 wire (low/high
-            // uint64 LE pair).
+            // long-Decimal: 16B LE signed two's-complement (cpp HUGEINT int128 wire).
             val loDec = stats.getDecimal(base, d.precision, d.scale)
             val hiDec = stats.getDecimal(base + 1, d.precision, d.scale)
             writeU32LE(baos, 16)
@@ -409,28 +346,22 @@ object CachedColumnarBatchKryoSerializer {
             writeU32LE(baos, 16)
             writeI128LE(baos, hiDec.toJavaBigDecimal.unscaledValue)
           case FloatType =>
-            // PA-10: 4B IEEE 754 float bits.
             writeU32LE(baos, 4)
             writeU32LE(baos, JFloat.floatToRawIntBits(stats.getFloat(base)))
             writeU32LE(baos, 4)
             writeU32LE(baos, JFloat.floatToRawIntBits(stats.getFloat(base + 1)))
           case DoubleType =>
-            // PA-10: 8B IEEE 754 double bits.
             writeU32LE(baos, 8)
             writeU64LE(baos, JDouble.doubleToRawLongBits(stats.getDouble(base)))
             writeU32LE(baos, 8)
             writeU64LE(baos, JDouble.doubleToRawLongBits(stats.getDouble(base + 1)))
           case BooleanType =>
-            // PA-10: 1B (0/1).
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base)) 1 else 0)
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base + 1)) 1 else 0)
           case StringType =>
-            // PA-9: variable-length UTF-8. lower = truncated 256B prefix
-            // (byte-wise <= original); upper = truncated 256B prefix with
-            // last byte +1 carry (byte-wise >= original). encodeStringBounds
-            // already validated carry didn't overflow (else demoted above).
+            // Pre-validated: encodeStringBounds returned Some, otherwise we'd have demoted.
             val (lo, hi) = stringPayload.get
             writeU32LE(baos, lo.length)
             baos.write(lo)
@@ -438,8 +369,7 @@ object CachedColumnarBatchKryoSerializer {
             baos.write(hi)
           case other =>
             throw new UnsupportedOperationException(
-              s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
-                "(landing in PA-6.B/C/F/G or PA-7..PA-10)")
+              s"serializeStats: dispatch for $other not implemented")
         }
       }
       col += 1
@@ -447,8 +377,7 @@ object CachedColumnarBatchKryoSerializer {
     baos.toByteArray
   }
 
-  // PA-6.0: schema parameter added for full-type dispatch (D-A5). PA-6.0 itself
-  // remains BIGINT-only behavior (schema unused); PA-6.A onwards reads it.
+  // schema may be null for legacy callsites; in that case behave as BIGINT-only (V2 read path).
   private[execution] def deserializeStats(
       blob: Array[Byte],
       schema: StructType): InternalRow = {
@@ -466,146 +395,94 @@ object CachedColumnarBatchKryoSerializer {
       val count = buf.getInt
       val sizeInBytes = buf.getLong
       if (supported == 1) {
-        // PA-6.A: dispatch by source-column dataType. schema==null => legacy
-        // BIGINT-only (PA-3.2). lowerLen on the wire still authoritative for
-        // payload width; we cross-check against schema dispatch.
         val dt: DataType =
           if (schema == null) LongType else schema(col).dataType
         val lowerLen = buf.getInt
         dt match {
-          case IntegerType
-              | DateType
-              | _: YearMonthIntervalType =>
-            require(
-              lowerLen == 4,
-              s"PA-6.A/D/F.1 Integer-family expects 4-byte lowerBound, got $lowerLen")
+          case IntegerType | DateType | _: YearMonthIntervalType =>
+            require(lowerLen == 4, s"Integer-family expects 4-byte lowerBound, got $lowerLen")
             row.update(base, buf.getInt)
             val upperLen = buf.getInt
-            require(
-              upperLen == 4,
-              s"PA-6.A/D/F.1 Integer-family expects 4-byte upperBound, got $upperLen")
+            require(upperLen == 4, s"Integer-family expects 4-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getInt)
           case ShortType =>
-            require(
-              lowerLen == 2,
-              s"PA-6.B ShortType expects 2-byte lowerBound, got $lowerLen")
+            require(lowerLen == 2, s"ShortType expects 2-byte lowerBound, got $lowerLen")
             row.update(base, buf.getShort)
             val upperLen = buf.getInt
-            require(
-              upperLen == 2,
-              s"PA-6.B ShortType expects 2-byte upperBound, got $upperLen")
+            require(upperLen == 2, s"ShortType expects 2-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getShort)
           case ByteType =>
-            require(
-              lowerLen == 1,
-              s"PA-6.C ByteType expects 1-byte lowerBound, got $lowerLen")
+            require(lowerLen == 1, s"ByteType expects 1-byte lowerBound, got $lowerLen")
             row.update(base, buf.get)
             val upperLen = buf.getInt
-            require(
-              upperLen == 1,
-              s"PA-6.C ByteType expects 1-byte upperBound, got $upperLen")
+            require(upperLen == 1, s"ByteType expects 1-byte upperBound, got $upperLen")
             row.update(base + 1, buf.get)
-          case LongType
-              | TimestampType
-              | TimestampNTZType
-              | _: DayTimeIntervalType =>
-            require(
-              lowerLen == 8,
-              s"PA-3.2/E/G Long-family expects 8-byte lowerBound, got $lowerLen")
+          case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType =>
+            require(lowerLen == 8, s"Long-family expects 8-byte lowerBound, got $lowerLen")
             row.update(base, buf.getLong)
             val upperLen = buf.getInt
-            require(
-              upperLen == 8,
-              s"PA-3.2/E/G Long-family expects 8-byte upperBound, got $upperLen")
+            require(upperLen == 8, s"Long-family expects 8-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getLong)
           case d: DecimalType if d.precision <= 18 =>
-            // PA-7: read 8B unscaled Long, reconstruct Decimal(unscaled, p, s).
-            // T1 trap: must wrap as Decimal, NOT raw Long, or
-            // SpecificInternalRow.getDecimal ClassCastException at codegen.
-            require(
-              lowerLen == 8,
-              s"PA-7 short-Decimal expects 8-byte lowerBound, got $lowerLen")
+            // Wrap as Decimal (NOT raw Long), else SpecificInternalRow.getDecimal CCEs at codegen.
+            require(lowerLen == 8, s"short-Decimal expects 8-byte lowerBound, got $lowerLen")
             row.update(base, Decimal(buf.getLong, d.precision, d.scale))
             val upperLen = buf.getInt
-            require(
-              upperLen == 8,
-              s"PA-7 short-Decimal expects 8-byte upperBound, got $upperLen")
-            row.update(
-              base + 1,
-              Decimal(buf.getLong, d.precision, d.scale))
+            require(upperLen == 8, s"short-Decimal expects 8-byte upperBound, got $upperLen")
+            row.update(base + 1, Decimal(buf.getLong, d.precision, d.scale))
           case d: DecimalType if d.precision <= 38 =>
-            // PA-8: read 16B LE signed two's-complement, reconstruct
-            // Decimal(BigDecimal(unscaled BigInteger, scale), p, s).
-            require(
-              lowerLen == 16,
-              s"PA-8 long-Decimal expects 16-byte lowerBound, got $lowerLen")
+            require(lowerLen == 16, s"long-Decimal expects 16-byte lowerBound, got $lowerLen")
             val loBytes = new Array[Byte](16)
             buf.get(loBytes)
             row.update(
               base,
-              Decimal(
-                new JBigDecimal(readI128LE(loBytes), d.scale),
-                d.precision,
-                d.scale))
+              Decimal(new JBigDecimal(readI128LE(loBytes), d.scale), d.precision, d.scale))
             val upperLenL = buf.getInt
-            require(
-              upperLenL == 16,
-              s"PA-8 long-Decimal expects 16-byte upperBound, got $upperLenL")
+            require(upperLenL == 16, s"long-Decimal expects 16-byte upperBound, got $upperLenL")
             val hiBytes = new Array[Byte](16)
             buf.get(hiBytes)
             row.update(
               base + 1,
-              Decimal(
-                new JBigDecimal(readI128LE(hiBytes), d.scale),
-                d.precision,
-                d.scale))
+              Decimal(new JBigDecimal(readI128LE(hiBytes), d.scale), d.precision, d.scale))
           case FloatType =>
-            require(lowerLen == 4, s"PA-10 FloatType expects 4B lowerBound, got $lowerLen")
+            require(lowerLen == 4, s"FloatType expects 4B lowerBound, got $lowerLen")
             row.update(base, JFloat.intBitsToFloat(buf.getInt))
             val upperLenF = buf.getInt
-            require(upperLenF == 4, s"PA-10 FloatType expects 4B upperBound, got $upperLenF")
+            require(upperLenF == 4, s"FloatType expects 4B upperBound, got $upperLenF")
             row.update(base + 1, JFloat.intBitsToFloat(buf.getInt))
           case DoubleType =>
-            require(lowerLen == 8, s"PA-10 DoubleType expects 8B lowerBound, got $lowerLen")
+            require(lowerLen == 8, s"DoubleType expects 8B lowerBound, got $lowerLen")
             row.update(base, JDouble.longBitsToDouble(buf.getLong))
             val upperLenD = buf.getInt
-            require(upperLenD == 8, s"PA-10 DoubleType expects 8B upperBound, got $upperLenD")
+            require(upperLenD == 8, s"DoubleType expects 8B upperBound, got $upperLenD")
             row.update(base + 1, JDouble.longBitsToDouble(buf.getLong))
           case BooleanType =>
-            require(lowerLen == 1, s"PA-10 BooleanType expects 1B lowerBound, got $lowerLen")
+            require(lowerLen == 1, s"BooleanType expects 1B lowerBound, got $lowerLen")
             row.update(base, buf.get != 0)
             val upperLenB = buf.getInt
-            require(upperLenB == 1, s"PA-10 BooleanType expects 1B upperBound, got $upperLenB")
+            require(upperLenB == 1, s"BooleanType expects 1B upperBound, got $upperLenB")
             row.update(base + 1, buf.get != 0)
           case StringType =>
-            // PA-9: variable-length UTF-8 bytes. lowerLen on wire is
-            // authoritative (truncated to 256B by encoder, may be 0 only
-            // when supported=0 -- this branch already inside supported==1).
             require(
               lowerLen >= 0 && lowerLen <= 256,
-              s"PA-9 StringType expects lowerBound in [0, 256], got $lowerLen")
+              s"StringType expects lowerBound in [0, 256], got $lowerLen")
             val loBytes = new Array[Byte](lowerLen)
             buf.get(loBytes)
             row.update(base, UTF8String.fromBytes(loBytes))
             val upperLenS = buf.getInt
             require(
               upperLenS >= 0 && upperLenS <= 256,
-              s"PA-9 StringType expects upperBound in [0, 256], got $upperLenS")
+              s"StringType expects upperBound in [0, 256], got $upperLenS")
             val hiBytes = new Array[Byte](upperLenS)
             buf.get(hiBytes)
             row.update(base + 1, UTF8String.fromBytes(hiBytes))
-          case other =>
-            // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
-            // BIGINT physical) or other types not yet in JVM dispatch.
-            // Skip payload (8B for BIGINT path) instead of crashing; mark
-            // as unsupported in the InternalRow (don't update lowerBound).
-            val lowerSkipLen = lowerLen
-            val lowerSkip = new Array[Byte](lowerSkipLen)
-            buf.get(lowerSkip)
+          case _ =>
+            // cpp may emit supported=1 for types not yet in JVM dispatch (e.g. short-Decimal as
+            // Velox BIGINT). Skip both payloads using their wire-declared lengths instead of
+            // crashing; the row keeps the slot null so the caller treats it as supported=false.
+            buf.get(new Array[Byte](lowerLen))
             val upperSkipLen = buf.getInt
-            val upperSkip = new Array[Byte](upperSkipLen)
-            buf.get(upperSkip)
-          // Caller treats null lowerBound/upperBound as supported=false.
+            buf.get(new Array[Byte](upperSkipLen))
         }
       }
       row.update(base + 2, nullCount)
@@ -639,12 +516,11 @@ object CachedColumnarBatchKryoSerializer {
   private def writeI64LE(out: ByteArrayOutputStream, v: Long): Unit =
     writeU64LE(out, v)
 
-  // PA-8: write 16B LE signed two's-complement representation of a BigInteger.
-  // BigInteger.toByteArray() returns big-endian signed bytes (minimal width);
-  // sign-extend to 16 and reverse. Throws if value doesn't fit in int128.
+  // 16B LE signed two's-complement representation of a BigInteger. BigInteger.toByteArray()
+  // returns big-endian signed minimal-width bytes; sign-extend to 16 then reverse to LE.
   private def writeI128LE(out: ByteArrayOutputStream, v: BigInteger): Unit = {
-    val raw = v.toByteArray // BE signed two's-complement
-    require(raw.length <= 16, s"PA-8 BigInteger does not fit int128 (${raw.length} bytes)")
+    val raw = v.toByteArray
+    require(raw.length <= 16, s"BigInteger does not fit int128 (${raw.length} bytes)")
     val padded = new Array[Byte](16)
     val signByte: Byte = if (v.signum < 0) 0xff.toByte else 0x00.toByte
     var i = 0
@@ -653,7 +529,6 @@ object CachedColumnarBatchKryoSerializer {
       i += 1
     }
     System.arraycopy(raw, 0, padded, 16 - raw.length, raw.length)
-    // reverse to LE
     var j = 0
     while (j < 8) {
       val t = padded(j)
@@ -664,9 +539,8 @@ object CachedColumnarBatchKryoSerializer {
     out.write(padded)
   }
 
-  // PA-8: read 16B LE signed two's-complement back into BigInteger.
   private def readI128LE(le: Array[Byte]): BigInteger = {
-    require(le.length == 16, s"PA-8 readI128LE expects 16 bytes, got ${le.length}")
+    require(le.length == 16, s"readI128LE expects 16 bytes, got ${le.length}")
     val be = new Array[Byte](16)
     var i = 0
     while (i < 16) {
@@ -676,25 +550,20 @@ object CachedColumnarBatchKryoSerializer {
     new BigInteger(be) // signed BE constructor
   }
 
-  // PA-9: encode (lo, hi) string bounds for wire. Truncate each to 256 bytes
-  // byte-wise. Lower bound truncation is monotonic <= the original (prefix
-  // is byte-wise lex-le). Upper bound truncation requires +1 carry on the
-  // last byte to ensure the truncated upper >= original; if the carry
-  // propagates past byte 0 (i.e. all 256 prefix bytes were 0xFF), we cannot
-  // form a safe upper bound -> return None so the caller demotes supported.
-  // Returns the (loEnc, hiEnc) byte arrays sized in [0, 256].
+  // Encode (lo, hi) string bounds for the wire by truncating each to 256 bytes.
+  // - Lower: prefix is byte-wise lex <= original, monotonic.
+  // - Upper: needs +1 carry on the truncated tail to ensure encoded >= original. If the carry
+  //   propagates past byte 0 (all 256 prefix bytes were 0xFF), we cannot form a safe widening
+  //   upper bound; return None so the caller demotes supported.
   private val PA9_STRING_TRUNCATE_LEN = 256
   private def encodeStringBounds(
       loBytes: Array[Byte],
       hiBytes: Array[Byte]): Option[(Array[Byte], Array[Byte])] = {
     val loLen = math.min(loBytes.length, PA9_STRING_TRUNCATE_LEN)
     val loEnc = Arrays.copyOf(loBytes, loLen)
-    val hiSrcLen = math.min(hiBytes.length, PA9_STRING_TRUNCATE_LEN)
-    // If the original upper fit entirely, no carry needed; emit as-is.
     if (hiBytes.length <= PA9_STRING_TRUNCATE_LEN) {
-      Some((loEnc, Arrays.copyOf(hiBytes, hiSrcLen)))
+      Some((loEnc, Arrays.copyOf(hiBytes, hiBytes.length)))
     } else {
-      // Truncated; need +1 carry on the prefix to ensure encoded >= original.
       val hiEnc = Arrays.copyOf(hiBytes, PA9_STRING_TRUNCATE_LEN)
       var i = PA9_STRING_TRUNCATE_LEN - 1
       while (i >= 0) {
@@ -706,24 +575,17 @@ object CachedColumnarBatchKryoSerializer {
         hiEnc(i) = 0.toByte
         i -= 1
       }
-      // Carry overflowed past byte 0 -- all 256 bytes were 0xFF. Cannot
-      // form a safe upper-bound widening, so demote to unsupported.
-      None
+      None // carry overflowed past byte 0
     }
   }
 
   /**
-   * PA-3.3: Parse the JNI `serializeWithStats` framed return into (stats InternalRow, bytesBlob
-   * Array[Byte]).
+   * Parse the JNI `serializeWithStats` framed return into (stats InternalRow, bytesBlob).
    *
-   * Framed layout (matches cpp/velox/operators/serializer/ VeloxColumnarBatchSerializer.cc PA-2.5c
-   * assembled return):
+   * Framed layout (matches cpp VeloxColumnarBatchSerializer.cc):
+   * `[ V2_MAGIC: 4B ] [ statsLen: u32 LE ] [ statsBlob ] [ bytesLen: u32 LE ] [ bytesBlob ]`.
    *
-   * [ V2_MAGIC: 4 bytes 0xFE 0xCA 0x53 0x02 ] [ statsLen: uint32 LE ] [ statsBlob: statsLen bytes ]
-   * [ bytesLen: uint32 LE ] [ bytesBlob: bytesLen bytes ]
-   *
-   * Eager guards catch corrupt magic / truncated framing before they propagate into a malformed
-   * CachedColumnarBatch.
+   * Eager guards catch corrupt magic / truncated framing before they propagate.
    */
   private[execution] def parseFramedBytes(
       framed: Array[Byte],
@@ -745,17 +607,14 @@ object CachedColumnarBatchKryoSerializer {
     val statsLen = buf.getInt
     require(
       statsLen >= 0 && statsLen <= buf.remaining() - 4,
-      s"framed bytes statsLen=$statsLen exceeds remaining buffer " +
-        s"${buf.remaining() - 4} (truncated?)")
+      s"framed bytes statsLen=$statsLen exceeds remaining buffer ${buf.remaining() - 4}")
     val statsBlob = new Array[Byte](statsLen)
     buf.get(statsBlob)
     val stats = deserializeStats(statsBlob, schema)
     val bytesLen = buf.getInt
     require(
       bytesLen >= 0 && bytesLen == buf.remaining(),
-      s"framed bytes bytesLen=$bytesLen != remaining buffer " +
-        s"${buf.remaining()} (truncated or trailing garbage). PA-6.5 H1 strict check."
-    )
+      s"framed bytes bytesLen=$bytesLen != remaining ${buf.remaining()} (truncated or trailing)")
     val bytesBlob = new Array[Byte](bytesLen)
     buf.get(bytesBlob)
     (stats, bytesBlob)
