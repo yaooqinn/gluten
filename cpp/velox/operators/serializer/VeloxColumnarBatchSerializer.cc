@@ -100,8 +100,9 @@ std::shared_ptr<ColumnarBatch> VeloxColumnarBatchSerializer::deserialize(uint8_t
 
 namespace {
 
-// Per-type FlatVector min/max scan + NaN guard. Returns false if column
-// must be marked unsupported (any NaN observed for floating-point types).
+// Per-type FlatVector min/max scan + NaN guard. Returns false when the column must be marked
+// unsupported (any NaN observed for floating-point types -- Spark equality NaN != NaN means
+// min/max-based pruning would silently drop matching rows).
 template <typename T>
 bool scanMinMax(
     const facebook::velox::FlatVector<T>* flat,
@@ -119,9 +120,6 @@ bool scanMinMax(
     }
     T v = values[i];
     if constexpr (std::is_floating_point_v<T>) {
-      // NaN poisons the whole column: Spark equality (NaN != NaN) means
-      // min/max-based pruning would silently drop matching rows. NB4
-      // ship blocker.
       if (std::isnan(v)) {
         return false;
       }
@@ -215,8 +213,6 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::DOUBLE: {
-        // PA-10: scanMinMax<double> NaN guard returns false on first NaN
-        // (poisons the column → emit supported=0 to avoid silent wrong prune).
         auto* flat = child->asFlatVector<double>();
         double lo = 0.0, hi = 0.0;
         supported = scanMinMax<double>(flat, lo, hi, nullCnt, seen);
@@ -229,9 +225,6 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::BOOLEAN: {
-        // PA-10: bool min/max via scanMinMax<bool>. Velox stores bool as
-        // packed bits but FlatVector<bool>::rawValues() exposes contiguous
-        // unsigned char buffer; scanMinMax compares 0/1 ints.
         auto* flat = child->asFlatVector<bool>();
         bool lo = false, hi = false;
         supported = scanMinMax<bool>(flat, lo, hi, nullCnt, seen);
@@ -244,9 +237,7 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::HUGEINT: {
-        // PA-8: restore HUGEINT scan for long-Decimal (precision > 18) marshal.
-        // (B4 in PA-6.5 dropped this when emit_gate excluded it; PA-8 wires it
-        // through with 16B LE.)
+        // long-Decimal (precision > 18); marshaled as 16B LE int128 downstream.
         auto* flat = child->asFlatVector<int128_t>();
         int128_t lo = 0, hi = 0;
         supported = scanMinMax<int128_t>(flat, lo, hi, nullCnt, seen);
@@ -259,13 +250,9 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::TIMESTAMP: {
-        // PA-6.2.E: Velox Timestamp struct {seconds, nanos} has defaulted
-        // operator<=> (Timestamp.h:377-378), so scanMinMax<Timestamp>
-        // compiles via the existing template. Variant<Timestamp> is a
-        // first-class scalar (Variant.h:259). Wire emit converts via
-        // Timestamp::toMicros() to int64 microseconds, sharing the JVM
-        // LongType 8B path (Spark TimestampType / TimestampNTZType
-        // physical = Long microseconds).
+        // Velox Timestamp has defaulted operator<=> (Timestamp.h) so scanMinMax compiles via the
+        // existing template. Wire emit converts via toMicros() to int64; Spark TimestampType /
+        // TimestampNTZType physical = Long microseconds.
         auto* flat = child->asFlatVector<Timestamp>();
         Timestamp lo, hi;
         supported = scanMinMax<Timestamp>(flat, lo, hi, nullCnt, seen);
@@ -278,36 +265,25 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         break;
       }
       case TypeKind::VARCHAR: {
-        // PA-9 + CB-2: VARCHAR scan via StringView. StringView::operator<=>
-        // (StringView.h:219) uses memcmp -> unsigned byte ordering, matching
-        // Spark ByteArray.compareBinary which uses Byte.toUnsignedInt + 0xFF
-        // (ByteArray.java). variant(std::string{sv}) heap-allocates owned
-        // string (Variant.h:232) so post-computeStats lifetime is decoupled
-        // from RowVector buffer.
+        // StringView::operator<=> uses memcmp -> unsigned byte ordering, matching Spark
+        // ByteArray.compareBinary. variant(std::string{sv}) heap-copies so post-computeStats
+        // lifetime is decoupled from the RowVector buffer.
         //
-        // CB-2 (Layer 2 mid-review #3 BLOCKER): cpp truncates to 256B at
-        // SOURCE so JVM never sees > 256B (single source of truth, vanilla
-        // parity gap explicit, JNI wire bytes capped). lower truncate is
-        // monotonic <= original by prefix property; upper requires +1 carry
-        // (carry-overflow on all-0xFF prefix demotes supported=0). Mirrors
-        // JVM PA-9 encodeStringBounds; design 0008 sec 3.1 declares the
-        // common contract.
+        // Truncate to 256B at the source so the JVM never sees > 256B (single source of truth).
+        // Lower bound: prefix is byte-wise <= original. Upper bound: prefix +1 carry on the
+        // rightmost byte to ensure encoded >= original; carry overflow on an all-0xFF prefix
+        // demotes supported=0. Mirrors the JVM-side encodeStringBounds; design 0008 sec 3.1.
         constexpr size_t kStatsStringTruncateLen = 256;
         auto* flat = child->asFlatVector<StringView>();
         StringView lo, hi;
         supported = scanMinMax<StringView>(flat, lo, hi, nullCnt, seen);
         if (supported && seen) {
-          // Lower bound: take prefix; prefix-property guarantees <= original.
           const size_t loLen = std::min(static_cast<size_t>(lo.size()), kStatsStringTruncateLen);
           std::string loBytes(lo.data(), loLen);
-          // Upper bound: take prefix; if truncated, +1 carry on last byte
-          // so encoded >= original byte-wise. Carry overflow (all-0xFF
-          // prefix) cannot widen -> demote.
           const size_t hiSrcLen = static_cast<size_t>(hi.size());
           std::string hiBytes(hi.data(), std::min(hiSrcLen, kStatsStringTruncateLen));
           bool hiOk = true;
           if (hiSrcLen > kStatsStringTruncateLen) {
-            // Apply +1 carry from the rightmost byte.
             bool carryDone = false;
             for (int i = static_cast<int>(hiBytes.size()) - 1; i >= 0; --i) {
               uint8_t b = static_cast<uint8_t>(hiBytes[i]) + 1;
@@ -326,15 +302,13 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
             stats.lowerBound = variant(std::move(loBytes));
             stats.upperBound = variant(std::move(hiBytes));
           } else {
-            // Carry overflowed -> cannot form safe upper bound.
             supported = false;
           }
         }
         break;
       }
       default:
-        // Other types deferred to later micro-slices (Integer / Double / String /
-        // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
+        // Unsupported type -> hasLowerBound=hasUpperBound=false -> JVM buildFilter pass-through.
         break;
     }
     stats.nullCount = nullCnt;
@@ -344,14 +318,14 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
 
 std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
     const std::shared_ptr<ColumnarBatch>& batch) {
-  // Step 1: compute stats over the inbound rowVector BEFORE delegating to the
-  // append path (which may consume / mutate iterator state on subsequent calls).
+  // Compute stats over the inbound rowVector BEFORE delegating to the append path (which may
+  // consume / mutate iterator state on subsequent calls).
   auto rowVector = VeloxColumnarBatch::from(veloxPool_.get(), batch)->getRowVector();
   const uint32_t numRows = static_cast<uint32_t>(rowVector->size());
   std::vector<ColumnStats> perCol = computeStats(rowVector);
   const uint32_t numCols = static_cast<uint32_t>(perCol.size());
 
-  // Step 2: marshal statsBlob per docs/0003 sec 3. Helpers append LE primitives.
+  // Marshal statsBlob (LE primitives via lambdas).
   std::vector<uint8_t> statsBlob;
   auto pushU8 = [&](uint8_t v) { statsBlob.push_back(v); };
   auto pushU32 = [&](uint32_t v) {
@@ -373,9 +347,6 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
 
   pushU32(numCols);
   for (const auto& s : perCol) {
-    // PA-6.2.B: dispatch by Variant typeKind for BIGINT/INTEGER/SMALLINT/TINYINT.
-    // Width matches JVM wire format (writeU64/U32/U16LE / 1B). REAL / HUGEINT
-    // marshaling still lands in follow-up slices.
     auto kind = s.lowerBound.kind();
     bool emitSupported = s.hasLowerBound && s.hasUpperBound &&
         s.lowerBound.kind() == s.upperBound.kind() &&
@@ -391,12 +362,10 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::VARCHAR);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
-    pushU32(numRows);  // PA-6.5 B3 (corrected post-Layer-2 #2): vanilla
-                       // PartitionStatistics.count = numRows (gatherNullStats
-                       // increments count too per ColumnStats.scala:65). Earlier
-                       // attempt subtracted nullCount, which inverted IsNotNull
-                       // predicate (count - nullCount > 0) into double-subtract.
-    pushU64(0);        // sizeInBytes placeholder (PA-2.5b)
+    // PartitionStatistics.count = numRows (vanilla gatherNullStats increments count for null
+    // rows too; subtracting nullCount inverts the IsNotNull predicate).
+    pushU32(numRows);
+    pushU64(0); // sizeInBytes placeholder
     if (emitSupported) {
       switch (kind) {
         case facebook::velox::TypeKind::BIGINT:
@@ -424,15 +393,11 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushU8(static_cast<uint8_t>(s.upperBound.value<int8_t>()));
           break;
         case facebook::velox::TypeKind::HUGEINT: {
-          // PA-8: 16 LE bytes. int128 split into low/high uint64 halves,
-          // little-endian wire order (low first). JVM reconstructs via
-          // BigInteger from signed two's-complement big-endian byte array
-          // (reverse on read).
+          // 16 LE bytes: int128 split into low/high uint64 halves, low first. JVM reconstructs
+          // via BigInteger from signed two's-complement big-endian byte array (reverse on read).
           auto pushI128LE = [&](int128_t v) {
-            uint64_t lo = static_cast<uint64_t>(v);
-            uint64_t hi = static_cast<uint64_t>(v >> 64);
-            pushU64(lo);
-            pushU64(hi);
+            pushU64(static_cast<uint64_t>(v));
+            pushU64(static_cast<uint64_t>(v >> 64));
           };
           pushU32(16);
           pushI128LE(s.lowerBound.value<int128_t>());
@@ -441,8 +406,6 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           break;
         }
         case facebook::velox::TypeKind::REAL: {
-          // PA-10: 4B IEEE 754 float, little-endian via bit reinterpret.
-          // JVM reconstructs via Float.intBitsToFloat.
           uint32_t loBits, hiBits;
           float lo = s.lowerBound.value<float>();
           float hi = s.upperBound.value<float>();
@@ -455,8 +418,6 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           break;
         }
         case facebook::velox::TypeKind::DOUBLE: {
-          // PA-10: 8B IEEE 754 double, little-endian via bit reinterpret.
-          // JVM reconstructs via Double.longBitsToDouble.
           uint64_t loBits, hiBits;
           double lo = s.lowerBound.value<double>();
           double hi = s.upperBound.value<double>();
@@ -468,36 +429,23 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushU64(hiBits);
           break;
         }
-        case facebook::velox::TypeKind::BOOLEAN: {
-          // PA-10: 1B (0 or 1).
+        case facebook::velox::TypeKind::BOOLEAN:
           pushU32(1);
           pushU8(s.lowerBound.value<bool>() ? 1 : 0);
           pushU32(1);
           pushU8(s.upperBound.value<bool>() ? 1 : 0);
           break;
-        }
         case facebook::velox::TypeKind::TIMESTAMP: {
-          // PA-6.2.E + CB-1: emit as 8B LE int64 microseconds. Spark
-          // TimestampType / TimestampNTZType physical = Long us; this
-          // shares the JVM LongType 8B wire arm with no JVM-side changes.
-          //
-          // CB-1 (Layer 2 mid-review #3 BLOCKER): Velox/Timestamp.h:183
-          // toMicros() = seconds * 1e6 + nanos / 1000 (integer floor).
-          // Naive use floors BOTH lo and hi. Floor on lo is OK (widens
-          // the prune interval downward, conservative). Floor on hi
-          // SHRINKS the prune interval and can false-negative drop rows
-          // whose true timestamp has nanos%1000 != 0.
-          //
-          // Fix: floor(lo), ceil(hi). ceil = floor + 1 us when there is
-          // any sub-microsecond residue (nanos % 1000 != 0).
+          // Spark Timestamp / TimestampNTZ physical = Long microseconds; share the JVM LongType
+          // 8B wire arm. Velox Timestamp::toMicros() floors toward -infinity. Floor on lo widens
+          // the prune interval downward (conservative) but floor on hi can shrink it and
+          // false-negative drop rows whose true ts has nanos % 1000 != 0. Fix: ceil hi by +1us
+          // when there is any sub-microsecond residue.
           const auto& loTs = s.lowerBound.value<facebook::velox::Timestamp>();
           const auto& hiTs = s.upperBound.value<facebook::velox::Timestamp>();
-          int64_t loMicros = loTs.toMicros();  // floor toward -inf is safe for lo
+          int64_t loMicros = loTs.toMicros();
           int64_t hiMicros = hiTs.toMicros();
           if (hiTs.getNanos() % 1000 != 0) {
-            // Conservative ceil: widen hi to next us boundary so the prune
-            // window covers the true value. (toMicros may throw on overflow,
-            // but +1 here cannot overflow since toMicros already validated.)
             hiMicros += 1;
           }
           pushU32(8);
@@ -507,10 +455,8 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           break;
         }
         case facebook::velox::TypeKind::VARCHAR: {
-          // PA-9: emit as len u32 LE + raw UTF-8 bytes. cpp does NOT
-          // truncate; JVM PA-9 applies 256B truncate + carry-overflow
-          // demote on read (design 0008 sec 3.1). variant.value<VARCHAR>()
-          // returns a std::string& (owned).
+          // Truncation already applied by computeStats (256B + carry); emit raw bytes with
+          // u32 LE length prefix. variant.value<VARCHAR>() returns owned std::string&.
           const auto& loStr = s.lowerBound.value<facebook::velox::TypeKind::VARCHAR>();
           const auto& hiStr = s.upperBound.value<facebook::velox::TypeKind::VARCHAR>();
           pushU32(static_cast<uint32_t>(loStr.size()));
@@ -530,34 +476,29 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
   }
   const uint32_t statsLen = static_cast<uint32_t>(statsBlob.size());
 
-  // Step 3: produce bytesBlob via existing serializer path.
+  // Produce bytesBlob via the existing serializer path.
   append(batch);
   const int64_t bytesLen = maxSerializedSize();
   std::vector<uint8_t> bytesBlob(bytesLen);
   serializeTo(bytesBlob.data(), bytesLen);
 
-  // Step 4: assemble [magic(4) | statsLen(4 LE) | statsBlob | bytesLen(4 LE) | bytesBlob].
+  // Assemble: [magic(4) | statsLen(u32 LE) | statsBlob | bytesLen(u32 LE) | bytesBlob].
   std::vector<uint8_t> framed;
   framed.reserve(4 + 4 + statsLen + 4 + bytesLen);
-
   framed.push_back(0xFE);
   framed.push_back(0xCA);
   framed.push_back(0x53);
   framed.push_back(0x02);
-
   framed.push_back(static_cast<uint8_t>(statsLen & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 8) & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 16) & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 24) & 0xFF));
-
   framed.insert(framed.end(), statsBlob.begin(), statsBlob.end());
-
   const uint32_t bytesLen32 = static_cast<uint32_t>(bytesLen);
   framed.push_back(static_cast<uint8_t>(bytesLen32 & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 8) & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 16) & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 24) & 0xFF));
-
   framed.insert(framed.end(), bytesBlob.begin(), bytesBlob.end());
   return framed;
 }
