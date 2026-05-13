@@ -52,7 +52,7 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
   test("PA-3.2.A statsBlob LE numCols + BIGINT cell round-trip byte-for-byte") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
 
     // Hand-compute expected wire:
     //   numCols=1 LE = 01 00 00 00
@@ -85,8 +85,8 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
   test("PA-3.2.B serializeStats then deserializeStats round-trip BIGINT 1-col") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](-7L, 999L, 3, 100, 1024L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
 
     assert(read.numFields === 5)
     assert(read.getLong(0) === -7L, "lowerBound at slot 0")
@@ -104,7 +104,7 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
     val corruptNumCols = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
       .putInt(Int.MaxValue).array()
     val ex = intercept[IllegalArgumentException] {
-      CachedColumnarBatchKryoSerializer.deserializeStats(corruptNumCols)
+      CachedColumnarBatchKryoSerializer.deserializeStats(corruptNumCols, null)
     }
     assert(
       ex.getMessage.contains("numCols"),
@@ -116,8 +116,8 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
   test("PA-3.2.D unsupported col round-trip preserves null bounds + metrics") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](null, null, 5, 50, 200L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
 
     assert(read.isNullAt(0), "lowerBound must be null for unsupported col")
     assert(read.isNullAt(1), "upperBound must be null for unsupported col")

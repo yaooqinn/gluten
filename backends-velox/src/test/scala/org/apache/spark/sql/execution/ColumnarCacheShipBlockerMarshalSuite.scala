@@ -50,8 +50,8 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     val hi = Decimal(BigDecimal("99.99"), 10, 2)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 800L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
     val dt = DecimalType(10, 2)
     val readLo = read.get(0, dt)
     val readHi = read.get(1, dt)
@@ -69,8 +69,8 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     val hi = Decimal(big, 30, 5)
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 1600L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
     val dt = DecimalType(30, 5)
     val readLo = read.get(0, dt)
     val readHi = read.get(1, dt)
@@ -95,8 +95,8 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
       0x87.toByte))
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 1024L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob)
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
     val readLo = read.getUTF8String(0)
     val readHi = read.getUTF8String(1)
     assert(readLo == lo, s"lower bound corrupted: expected $lo got $readLo")

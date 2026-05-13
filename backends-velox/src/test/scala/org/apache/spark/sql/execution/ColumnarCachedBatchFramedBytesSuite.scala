@@ -44,7 +44,7 @@ import org.scalatest.funsuite.AnyFunSuite
 class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
 
   private def craftFramed(stats: InternalRow, bytesBlob: Array[Byte]): Array[Byte] = {
-    val statsBlob = CachedColumnarBatchKryoSerializer.serializeStats(stats)
+    val statsBlob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
     val out = new java.io.ByteArrayOutputStream()
     out.write(CachedColumnarBatchKryoSerializer.V2_MAGIC)
     writeU32LE(out, statsBlob.length)
@@ -70,7 +70,7 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     val framed = craftFramed(stats, payload)
 
     val (parsedStats, parsedBytes) =
-      CachedColumnarBatchKryoSerializer.parseFramedBytes(framed)
+      CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, null)
 
     assert(parsedBytes === payload, "bytesBlob round-trip exact")
     assert(parsedStats !== null, "stats round-trip non-null")
@@ -93,7 +93,7 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     bad(0) = 0x00.toByte // corrupt magic byte 0
 
     val ex = intercept[IllegalArgumentException] {
-      CachedColumnarBatchKryoSerializer.parseFramedBytes(bad)
+      CachedColumnarBatchKryoSerializer.parseFramedBytes(bad, null)
     }
     assert(
       ex.getMessage.toLowerCase(java.util.Locale.ROOT).contains("magic"),
@@ -109,7 +109,7 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     val truncated = good.take(8) // magic + statsLen only, no statsBlob
 
     intercept[Exception] {
-      CachedColumnarBatchKryoSerializer.parseFramedBytes(truncated)
+      CachedColumnarBatchKryoSerializer.parseFramedBytes(truncated, null)
     }
   }
 }

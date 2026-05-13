@@ -69,7 +69,12 @@ case class CachedColumnarBatch(
     override val numRows: Int,
     override val sizeInBytes: Long,
     bytes: Array[Byte],
-    override val stats: InternalRow)
+    override val stats: InternalRow,
+    // PA-6.0: schema carried per-batch so Kryo read path can dispatch
+    // serializeStats / deserializeStats by source-column dataType (vanilla full-type
+    // alignment per design 0008 D-A5). Nullable for v1 binary back-compat
+    // (legacy stats=null cache batches have no schema either).
+    schema: org.apache.spark.sql.types.StructType = null)
   extends SimpleMetricsCachedBatch
 
 /**
@@ -132,9 +137,21 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       output.writeBoolean(false)
     } else {
       output.writeBoolean(true)
-      val statsBytes = CachedColumnarBatchKryoSerializer.serializeStats(batch.stats)
+      val statsBytes = CachedColumnarBatchKryoSerializer.serializeStats(batch.stats, batch.schema)
       output.writeInt(statsBytes.length)
       output.writeBytes(statsBytes)
+    }
+    // PA-6.0: schema for full-type dispatch (D-A5). Nullable: hasStats=false
+    // batches still write hasSchema=false. v3 layout uses an explicit boolean
+    // tag so reader can skip the JSON segment when schema is absent.
+    if (batch.schema == null) {
+      output.writeBoolean(false)
+    } else {
+      output.writeBoolean(true)
+      val schemaJson = batch.schema.json
+      val schemaBytes = schemaJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      output.writeInt(schemaBytes.length)
+      output.writeBytes(schemaBytes)
     }
   }
 
@@ -162,15 +179,45 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
     val hasStats = input.readBoolean()
-    val stats: InternalRow = if (hasStats) {
+    // PA-6.0: read schema first when present so deserializeStats can dispatch
+    // by dataType. v3 layout: hasStats then statsBytes (if any) then hasSchema
+    // then schemaJsonBytes (if any). Order MUST match writer above.
+    // NOTE: avoid `val (a: T, b: U) = ...` tuple destructuring with type
+    // ascription -- Scala 2.13 erases the Tuple2 generics and a typed-pattern
+    // match against `Tuple2` throws MatchError at runtime.
+    val statsAndSchema: (InternalRow, org.apache.spark.sql.types.StructType) = if (hasStats) {
       val statsLen = input.readInt()
       val statsBytes = new Array[Byte](statsLen)
       input.readBytes(statsBytes)
-      CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes)
+      val hasSchema = input.readBoolean()
+      val sch = if (hasSchema) {
+        val schemaLen = input.readInt()
+        val schemaBytes = new Array[Byte](schemaLen)
+        input.readBytes(schemaBytes)
+        org.apache.spark.sql.types.DataType
+          .fromJson(new String(schemaBytes, java.nio.charset.StandardCharsets.UTF_8))
+          .asInstanceOf[org.apache.spark.sql.types.StructType]
+      } else {
+        null
+      }
+      (CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes, sch), sch)
     } else {
-      null
+      // Even with stats=null we must consume the hasSchema tag to keep the
+      // stream aligned for any subsequent batches in the same Kryo session.
+      val hasSchema = input.readBoolean()
+      val sch = if (hasSchema) {
+        val schemaLen = input.readInt()
+        val schemaBytes = new Array[Byte](schemaLen)
+        input.readBytes(schemaBytes)
+        org.apache.spark.sql.types.DataType
+          .fromJson(new String(schemaBytes, java.nio.charset.StandardCharsets.UTF_8))
+          .asInstanceOf[org.apache.spark.sql.types.StructType]
+      } else {
+        null
+      }
+      (null, sch)
     }
-    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats)
+    CachedColumnarBatch(numRows, sizeInBytes, bytes, statsAndSchema._1, statsAndSchema._2)
   }
 
   private def readV1(input: Input, first4: Array[Byte]): CachedColumnarBatch = {
@@ -189,7 +236,9 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     val bytes = new Array[Byte](length - 1)
     input.readBytes(bytes)
     // stats=null -> buildFilter override falls back to pass-through (graceful degrade).
-    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats = null)
+    // PA-6.0: v1 has no schema either, pass null schema; CachedColumnarBatch.schema
+    // defaults to null so this remains source-compatible.
+    CachedColumnarBatch(numRows, sizeInBytes, bytes, stats = null, schema = null)
   }
 }
 
@@ -223,7 +272,15 @@ object CachedColumnarBatchKryoSerializer {
   // order (lowerBound, upperBound, nullCount, count, sizeInBytes) per docs/0003
   // sec 3 + investigations/0003 rev 2 evidence 2. PA-1 placeholder used 2
   // slots; PA-3.2 + test update align with vanilla.
-  private[execution] def serializeStats(stats: InternalRow): Array[Byte] = {
+  //
+  // PA-6.0: schema parameter added for full-type dispatch (D-A5). PA-6.0 itself
+  // remains BIGINT-only behavior (schema is unused inside); PA-6.A onwards adds
+  // per-column dataType dispatch reading the schema. schema may be null for
+  // legacy callsites that have not been updated; in that case we keep the
+  // PA-3.2 BIGINT-only behavior (backward compatible).
+  private[execution] def serializeStats(
+      stats: InternalRow,
+      schema: org.apache.spark.sql.types.StructType): Array[Byte] = {
     require(
       stats.numFields % 5 == 0,
       s"stats InternalRow numFields=${stats.numFields} must be a multiple of 5 " +
@@ -253,7 +310,11 @@ object CachedColumnarBatchKryoSerializer {
     baos.toByteArray
   }
 
-  private[execution] def deserializeStats(blob: Array[Byte]): InternalRow = {
+  // PA-6.0: schema parameter added for full-type dispatch (D-A5). PA-6.0 itself
+  // remains BIGINT-only behavior (schema unused); PA-6.A onwards reads it.
+  private[execution] def deserializeStats(
+      blob: Array[Byte],
+      schema: org.apache.spark.sql.types.StructType): InternalRow = {
     val buf = java.nio.ByteBuffer.wrap(blob).order(java.nio.ByteOrder.LITTLE_ENDIAN)
     val numCols = buf.getInt
     require(
@@ -318,7 +379,9 @@ object CachedColumnarBatchKryoSerializer {
    * Eager guards catch corrupt magic / truncated framing before they propagate into a malformed
    * CachedColumnarBatch.
    */
-  private[execution] def parseFramedBytes(framed: Array[Byte]): (InternalRow, Array[Byte]) = {
+  private[execution] def parseFramedBytes(
+      framed: Array[Byte],
+      schema: org.apache.spark.sql.types.StructType): (InternalRow, Array[Byte]) = {
     require(
       framed != null && framed.length >= 4 + 4 + 4,
       s"framed bytes too short: len=${if (framed == null) -1 else framed.length}")
@@ -340,7 +403,7 @@ object CachedColumnarBatchKryoSerializer {
         s"${buf.remaining() - 4} (truncated?)")
     val statsBlob = new Array[Byte](statsLen)
     buf.get(statsBlob)
-    val stats = deserializeStats(statsBlob)
+    val stats = deserializeStats(statsBlob, schema)
     val bytesLen = buf.getInt
     require(
       bytesLen >= 0 && bytesLen <= buf.remaining(),
@@ -496,13 +559,24 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
               GlutenConfig.get.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED)
             if (partitionStatsEnabled && ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
               val framed = jni.serializeWithStats(handle)
+              // PA-6.0: convert Seq[Attribute] to StructType once and carry per-batch
+              // so Kryo (spill / disk cache) read path can dispatch by dataType.
+              val structSchema = org.apache.spark.sql.types.StructType(
+                schema.map(
+                  a =>
+                    org.apache.spark.sql.types.StructField(a.name, a.dataType, a.nullable)))
               val (stats, bytesBlob) =
-                CachedColumnarBatchKryoSerializer.parseFramedBytes(framed)
-              CachedColumnarBatch(batch.numRows(), bytesBlob.length, bytesBlob, stats)
+                CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, structSchema)
+              CachedColumnarBatch(batch.numRows(), bytesBlob.length, bytesBlob, stats, structSchema)
             } else {
               val unsafeBuffer = jni.serialize(handle)
               val bytes = unsafeBuffer.toByteArray
-              CachedColumnarBatch(batch.numRows(), bytes.length, bytes, stats = null)
+              CachedColumnarBatch(
+                batch.numRows(),
+                bytes.length,
+                bytes,
+                stats = null,
+                schema = null)
             }
           }
         }
