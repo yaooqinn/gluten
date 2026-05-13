@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.types.{ByteType, IntegerType, LongType, ShortType, StructField, StructType}
+import org.apache.spark.sql.types.{ByteType, DayTimeIntervalType, IntegerType, LongType, ShortType, StructField, StructType, YearMonthIntervalType}
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -102,5 +102,49 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getByte(0) == lo, s"lower: expected $lo got ${read.getByte(0)}")
     assert(read.getByte(1) == hi, s"upper: expected $hi got ${read.getByte(1)}")
     assert(read.getInt(3) == 50, "count roundtrip")
+  }
+
+  // PA-6.F.1 RED expected: YearMonthIntervalType not in dispatch.
+  // GREEN: YearMonthIntervalType reuses the IntegerType branch (4 LE bytes,
+  // physical Int per spark/.../YearMonthIntervalType.scala defaultSize == 4).
+  test("PA-6.F.1 YearMonthInterval round-trip 4B LE (months as Int)") {
+    val lo: Integer = Int.box(-12)
+    val hi: Integer = Int.box(36)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 10, 40L))
+    val schema = StructType(
+      Seq(
+        StructField("k.lowerBound", YearMonthIntervalType(), nullable = true),
+        StructField("k.upperBound", YearMonthIntervalType(), nullable = true),
+        StructField("k.nullCount", IntegerType, nullable = false),
+        StructField("k.count", IntegerType, nullable = false),
+        StructField("k.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getInt(0) == lo, s"lower: expected $lo got ${read.getInt(0)}")
+    assert(read.getInt(1) == hi, s"upper: expected $hi got ${read.getInt(1)}")
+  }
+
+  // PA-6.F.2 RED expected: DayTimeIntervalType not in dispatch.
+  // GREEN: DayTimeIntervalType reuses the LongType branch (8 LE bytes,
+  // physical Long microseconds per spark DayTimeIntervalType defaultSize == 8).
+  test("PA-6.F.2 DayTimeInterval round-trip 8B LE (microseconds as Long)") {
+    val lo: java.lang.Long = Long.box(-86400000000L)
+    val hi: java.lang.Long = Long.box(86400000000L)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 10, 80L))
+    val schema = StructType(
+      Seq(
+        StructField("k.lowerBound", DayTimeIntervalType(), nullable = true),
+        StructField("k.upperBound", DayTimeIntervalType(), nullable = true),
+        StructField("k.nullCount", IntegerType, nullable = false),
+        StructField("k.count", IntegerType, nullable = false),
+        StructField("k.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getLong(0) == lo, s"lower: expected $lo got ${read.getLong(0)}")
+    assert(read.getLong(1) == hi, s"upper: expected $hi got ${read.getLong(1)}")
   }
 }
