@@ -22,24 +22,12 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * PA-3.3 RED tests for JNI `serializeWithStats` framed-byte parser.
+ * Tests for JNI `serializeWithStats` framed-byte parser. Pure JVM; crafts framed bytes by hand via
+ * serializeStats, then exercises parseFramedBytes round-trip + corrupt-magic / truncated-blob
+ * guards.
  *
- * Framed layout (cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5c assembled
- * return):
- *
- * [ V2_MAGIC: 4 bytes 0xFE 0xCA 0x53 0x02 ] [ statsLen: uint32 LE ] [ statsBlob: statsLen bytes ]
- * -- consumed by deserializeStats (PA-3.2) [ bytesLen: uint32 LE ] [ bytesBlob: bytesLen bytes ] --
- * the original Velox serialize() payload
- *
- * Pure JVM. Crafts framed bytes by hand using PA-3.2 serializeStats, exercises
- * CachedColumnarBatchKryoSerializer.parseFramedBytes (PA-3.3 GREEN production helper) round-trip +
- * corrupt-magic + truncated-blob guards.
- *
- * Refs:
- *   - todos/features/gluten-inmemory-cache-stats/docs/0003-jni-binary-framing-reference.md rev 4
- *     sec 2 (top-level framing)
- *   - cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5c
- *   - cpp/velox/tests/VeloxColumnarBatchSerializerTest.cc PA_2_5a/b
+ * Layout: `[ V2_MAGIC: 4B 0xFE 0xCA 0x53 0x02 ] [ statsLen: u32 LE ] [ statsBlob ] [ bytesLen: u32
+ * LE ] [ bytesBlob ]`.
  */
 class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
 

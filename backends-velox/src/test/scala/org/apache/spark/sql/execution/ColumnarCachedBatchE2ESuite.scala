@@ -25,13 +25,10 @@ import org.apache.spark.sql.execution.columnar.{InMemoryTableScanExec, SparkCach
 import org.apache.spark.sql.functions.{col, lit, when}
 
 /**
- * PA-3.5 e2e smoke for Gluten in-memory cache stats (Layer A min/max).
+ * End-to-end smoke for Gluten in-memory cache stats (Layer A min/max).
  *
- * Scope: end-to-end smoke only - assert no crash, correct result, plan shape, and `numOutputRows`
- * significantly less than total rows. The precise prune semantics are anchored by
- * `ColumnarCachedBatchBuildFilterPruneSuite` (PA-3.4).
- *
- * Refs: todos/features/gluten-inmemory-cache-stats/docs/0005-pa35-e2e-test-shape-note.md
+ * Asserts no crash, correct result, plan shape, and `numOutputRows` significantly less than total
+ * rows. Precise prune semantics live in `ColumnarCachedBatchBuildFilterPruneSuite`.
  */
 class ColumnarCachedBatchE2ESuite
   extends VeloxWholeStageTransformerSuite
@@ -139,12 +136,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-5.A ship blocker (BL7): all-null Long column. partition that contains
-  // only nulls must NOT be incorrectly pruned by min/max stats (lower=upper=
-  // sentinel would silently drop the matching null row, but null comparison
-  // semantics mean WHERE col = 5 returns no rows ANYWAY -- the real risk is
-  // mishandling the all-null case during stats compute, leading to crash or
-  // wrong metadata. We assert: cache + filter on all-null column doesn't
-  // crash and returns the correct (empty) result.
+
   test("PA-5.A all-null Long column: cache + equality filter no crash + correct result") {
     val df = spark
       .range(N)
@@ -163,20 +155,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-5.B ship blocker (NB4): partition containing NaN Float must NOT have
-  // valid min/max bounds -- cpp poison guard sets supported=false on any NaN.
-  // If guard is missing, NaN propagates into stats and arbitrary partitions
-  // get silently pruned. Assert: WHERE col = 1.5 still returns the matching
-  // non-NaN row even when other rows in same partition are NaN.
-  // SCOPE NOTE: Layer A ships BIGINT-only stats; Float/Double marshal is
-  // phase-2. Initial run returned 0 rows (entire cache pruned), suggesting cpp
-  // either (a) silently treats Float as BIGINT and packs NaN bits as Long, or
-  // (b) ANSI-mode plan fallback breaks the cache hit. Investigation doc:
-  // todos/features/gluten-inmemory-cache-stats/investigations/0006-pa5b-float-nan-prune.md
-  // Trigger: when Float/Double marshal lands or NaN root cause is fixed.
-  // PA-10 (was PA-5.B): with Float marshal landed, NaN guard at cpp
-  // scanMinMax<float>:124 prevents poisoned bounds. Verify e2e: cache
-  // a Float column with one NaN sprinkled in; query for non-NaN value
-  // must still find it (no silent prune).
+
   test("PA-10 Float NaN partition: filter on non-NaN not silently pruned") {
     val df = spark
       .range(N)
@@ -202,12 +181,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-6.2.D Date e2e prune correctness: with cpp INTEGER computeStats +
-  // 4B LE marshal landed in PA-6.2.B, a DateType column (days-since-epoch
-  // Int) must end-to-end prune the same way BIGINT does. Asserts:
-  //   (1) no crash
-  //   (2) result count correct
-  //   (3) numOutputRows << N (full-scan refuted)
-  // Refs: docs/0008-d-a5-full-type-alignment.md
+
   test("PA-6.2.D Date column equality filter: prune via INTEGER stats (4B LE)") {
     import org.apache.spark.sql.functions.{date_add, lit => sparkLit}
     val base = sparkLit("2020-01-01").cast("date")
@@ -239,9 +213,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-6.5 B1 regression: multi-column cache must not crash with
-  // IndexOutOfBoundsException. Pre-fix `schema(base)` (base=col*5) threw
-  // for any col>=1. This asserts both no-crash and correct-result on a
-  // 3-column LongType cache.
+
   test("PA-6.5 B1 multi-column cache: no IndexOOB + correct result") {
     val cached = spark
       .range(N)
@@ -261,8 +233,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-6.5 B2 regression: short-Decimal source column must not crash
-  // (Velox emits supported=1 as BIGINT physical; JVM-side allowlist
-  // demotes to supported=0 until PA-7 marshal lands).
+
   test("PA-6.5 B2 Decimal column cache: no UOE crash on materialize + read") {
     val cached = spark
       .range(N)
@@ -279,12 +250,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-8.5 SB1 regression: IsNotNull predicate must NOT silently skip a
-  // partition just because it has nullCount > 0. Vanilla buildFilter
-  // computes (count - nullCount > 0) where count = numRows (vanilla
-  // gatherNullStats increments count on null rows too). If cpp emits
-  // count = numRows - nullCount instead, the predicate becomes
-  // (numRows - 2*nullCount > 0) and silently false-negatives partitions
-  // with nullCount > numRows/2.
+
   test("PA-8.5 SB1 IsNotNull predicate honors vanilla count semantics") {
     val df = spark
       .range(N)
@@ -304,10 +270,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-6.2.E e2e Timestamp prune: TimestampType physically Long microseconds
-  // (Spark) -> Velox Timestamp struct{seconds, nanos}. cpp scanMinMax<Timestamp>
-  // GREEN in PA-6.2.E; emit converts via toMicros() to share JVM LongType 8B
-  // wire arm. This sentinel proves: (a) no crash on cache + filter, (b) correct
-  // result, (c) prune effective (numOutputRows <= 2 * (N/P)).
+
   test("PA-6.2.E Timestamp column equality filter: prune via Long us stats (8B LE)") {
     import org.apache.spark.sql.functions.{lit => sparkLit}
     // Build N rows of distinct timestamps, one second apart starting at epoch
@@ -342,9 +305,7 @@ class ColumnarCachedBatchE2ESuite
   }
 
   // PA-9 e2e String prune sentinel. cpp scanMinMax<StringView> + variant
-  // owning copy, JVM PA-9 read with 256B truncate. Build N keys k_0000 .. k_0999
-  // (lex-sortable so range partitioning gives disjoint string intervals);
-  // pivot at k_0500 falls inside one partition.
+
   test("PA-9 String column equality filter: prune via byte-unsigned stats") {
     val cached = spark
       .range(N)

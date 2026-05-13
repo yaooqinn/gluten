@@ -23,23 +23,13 @@ import org.apache.spark.sql.types.{ByteType, DateType, DayTimeIntervalType, Inte
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * PA-6 G1 integer-family marshal tests (JVM-only unit tests, no native build).
- *
- * The cpp side (PA-6.2) emits supported=0 for non-BIGINT integer columns until the typeKind
- * dispatch lands. These tests pin the JVM serialize/deserialize dispatch by source-column dataType
- * so that when cpp catches up, plumbing is already correct (and end-to-end prune in PA-6.D/E
- * becomes a pure cpp delta).
- *
- * Refs: todos/features/gluten-inmemory-cache-stats/docs/0008-layerA-fulltype-extension.md
- * todos/features/gluten-inmemory-cache-stats/docs/0004-layerA-implementation-plan.md PA-6
+ * Integer-family marshal tests (INT / SMALLINT / TINYINT / Date / interval). JVM-only; pins
+ * serialize/deserialize dispatch by source-column dataType.
  */
 class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
 
-  // PA-6.A RED expected: serializeStats currently hard-calls stats.getLong(base)
-  // for every column (BIGINT-only PA-3.2 path); supplying an Integer lo/hi will
-  // throw ClassCastException at unboxToLong even though we now pass the schema.
-  // GREEN: serializeStats branches on schema(col).dataType, writes 4-byte LE for
-  // IntegerType, and deserializeStats reads it back as Int.
+  // PA-6.A serializeStats currently hard-calls stats.getLong(base)
+
   test("PA-6.A INT round-trip 4B LE preserves value") {
     val lo: Integer = Int.box(-2147483)
     val hi: Integer = Int.box(2147483)
@@ -104,9 +94,8 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(3) == 50, "count roundtrip")
   }
 
-  // PA-6.F.1 RED expected: YearMonthIntervalType not in dispatch.
-  // GREEN: YearMonthIntervalType reuses the IntegerType branch (4 LE bytes,
-  // physical Int per spark/.../YearMonthIntervalType.scala defaultSize == 4).
+  // PA-6.F.1 YearMonthIntervalType not in dispatch.
+
   test("PA-6.F.1 YearMonthInterval round-trip 4B LE (months as Int)") {
     val lo: Integer = Int.box(-12)
     val hi: Integer = Int.box(36)
@@ -126,9 +115,8 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(1) == hi, s"upper: expected $hi got ${read.getInt(1)}")
   }
 
-  // PA-6.F.2 RED expected: DayTimeIntervalType not in dispatch.
-  // GREEN: DayTimeIntervalType reuses the LongType branch (8 LE bytes,
-  // physical Long microseconds per spark DayTimeIntervalType defaultSize == 8).
+  // PA-6.F.2 DayTimeIntervalType not in dispatch.
+
   test("PA-6.F.2 DayTimeInterval round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(-86400000000L)
     val hi: java.lang.Long = Long.box(86400000000L)

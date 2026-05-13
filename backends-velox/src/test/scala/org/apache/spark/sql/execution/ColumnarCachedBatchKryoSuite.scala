@@ -26,20 +26,12 @@ import org.scalatest.funsuite.AnyFunSuite
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 
 /**
- * PA-1 RED tests for CachedColumnarBatch stats field + Kryo magic-prefix sniff.
+ * Tests for CachedColumnarBatch Kryo (de)serialization with magic-prefix versioning. Pure JVM, no
+ * native lib required.
  *
- * Refs:
- *   - todos/features/gluten-inmemory-cache-stats/docs/0001-layerA-minmax-design.md D-A2 + D-A3
- *   - todos/features/gluten-inmemory-cache-stats/docs/0002-cpp-stats-contract.md sec 4 (BL3 + NB1)
- *   - todos/features/gluten-inmemory-cache-stats/docs/0003-jni-binary-framing-reference.md sec 9
- *   - todos/features/gluten-inmemory-cache-stats/docs/0004-layerA-implementation-plan.md PA-1
- *
- * Pure JVM-only suite. No native lib required.
- *
- * Kryo wire format note: Kryo 4.0.3 `Output.writeInt(int)` writes a fixed 4-byte BIG-ENDIAN int.
- * The (int, boolean) overload silently forwards to writeVarInt (1-5 bytes), which is incompatible
- * with our magic-prefix sniff invariant. Tests below use the single-arg overload to mimic the
- * legacy pre-PA-1 (v1) writer faithfully.
+ * Wire-format invariant: Kryo `Output.writeInt(int)` writes a fixed 4-byte BIG-ENDIAN int; the
+ * (int, boolean) overload silently forwards to writeVarInt (1-5 bytes), which would break the
+ * 4-byte magic-prefix sniff. The legacy V1 writer used here uses the single-arg overload.
  */
 class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
 
@@ -48,11 +40,9 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
 
   private def newKryo(): Kryo = new Kryo()
 
-  // Direct serializer.write / serializer.read bypasses Kryo's reference-tracking
-  // envelope (writeObject/readObject would prepend a varint refId, breaking the
-  // 4-byte magic-prefix sniff). Production code path is invoked the same way
-  // via Spark's SerializerInstance internals where reference tracking is off
-  // for cached batch payloads (see ColumnarCachedBatchSerializer wiring).
+  // Use serializer.write / serializer.read directly; writeObject/readObject would prepend a
+  // varint refId envelope and break the magic-prefix sniff. Production goes through Spark
+  // SerializerInstance internals where reference tracking is off for cached batches.
   private def roundTrip(batch: CachedColumnarBatch): CachedColumnarBatch = {
     val ser = newSerializer()
     val kryo = newKryo()
@@ -67,18 +57,7 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
   }
 
   // RED case 1: case class currently has 3 fields (numRows, sizeInBytes, bytes).
-  // Adding `stats: InternalRow` requires the case class to accept a 4th param.
-  //
-  // Expected RED failure: compile error "stats is not a member of
-  // CachedColumnarBatch" / "too many arguments" until case class gains the
-  // stats field AND extends SimpleMetricsCachedBatch trait.
-  // PA-3.2 RED case: PA-1.1 was using 2-field placeholder stats (42L, 100L)
-  // which does not match the vanilla 5-slots-per-col PartitionStatistics
-  // schema (lowerBound, upperBound, nullCount, count, sizeInBytes). PA-3.2
-  // production change replaces Java Serialization with statsBlob binary
-  // framing aligned to the vanilla schema; this also requires PA-1.1 to use
-  // a 5-field stats row. Updated to BIGINT 1-col: lower=42, upper=100,
-  // nullCount=0, count=10, sizeInBytes=64.
+
   test("PA-1.1 testStatsFieldRoundTripV2") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
@@ -131,13 +110,7 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
   }
 
   // RED case 2: backward compat -- v1 binary (without magic prefix) read by v2
-  // reader should yield stats=null (graceful degrade for buildFilter pass-through;
-  // Spark Streaming cross-version safe).
-  //
-  // Expected RED failure: pre-PA-1 reader does not implement magic-prefix sniff
-  // and tries to deserialize v1 binary as if it had stats=true, yielding
-  // KryoException ("buffer underflow") or wrong field values. Once PA-1 GREEN
-  // adds magic-prefix sniff + readV1 fallback, this case GREEN.
+
   test("PA-1.2 testKryoV1Backwards") {
     val payload = Array[Byte](9, 8, 7)
     val v1Binary = craftV1Binary(numRows = 7, sizeInBytes = 123L, payload = payload)
@@ -151,24 +124,7 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
   }
 
   // PA-1.3 NB1 ship-blocker -- the 4-byte magic-prefix design choice (vs naive
-  // single-byte sniff) prevents silent corruption of v1 binaries.
-  //
-  // We exercise the protection in two ways:
-  //
-  //   (a) Positive: the production reader correctly reads a v1 binary whose
-  //       LOW byte is 0x02 (numRows=258 => BE bytes [0x00, 0x00, 0x01, 0x02]).
-  //       Any sane prefix sniff must NOT mis-identify this as v2.
-  //
-  //   (b) Negative (anti-regression): a hypothetical NaiveSingleByteSniffSerializer
-  //       that only checks the first byte for 0x02 (which is the LOW byte of
-  //       V2_MAGIC under BE) would mis-identify v1 numRows whose BE low byte
-  //       is 0x02 as v2 -> silent corruption. We assert this naive impl FAILS
-  //       to round-trip, demonstrating the corruption mode the production
-  //       4-byte magic prevents.
-  //
-  // Expected RED failure: production impl (a) is the same impl as PA-1.2 for
-  // sniff logic; PA-1.3 is satisfied once sniff matches all 4 magic bytes
-  // (not just one). Naive (b) demonstrates the corruption mode by construction.
+
   test("PA-1.3 testV1MagicPrefixGuardsAgainstSilentCorruption") {
     // (a) Production reader: numRows=258 v1 binary should be read correctly.
     // BE encoding of 258 is [0x00, 0x00, 0x01, 0x02], so v1 binary's first

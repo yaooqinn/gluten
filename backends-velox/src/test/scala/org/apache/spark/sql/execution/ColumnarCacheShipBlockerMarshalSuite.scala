@@ -24,28 +24,14 @@ import org.apache.spark.unsafe.types.UTF8String
 import org.scalatest.funsuite.AnyFunSuite
 
 /**
- * PA-5 ship blocker acceptance tests for FUTURE non-BIGINT marshal paths.
- *
- * Layer A scope (this PR): BIGINT min/max only. cpp PA-2.5b emits supported=0 for Decimal / String
- * / Float / Double columns, so the JVM marshal layer never sees non-Long objects in lo/hi slots --
- * the null-sentinel path is covered by PA-3.2.D ("unsupported col round-trip preserves null bounds
- * + metrics").
- *
- * These ignored tests are kept as ACCEPTANCE CRITERIA for the follow-up PR that adds Decimal /
- * String marshal on the cpp side. When that PR lands, flip ignore -> test and they MUST pass before
- * merge -- otherwise silent corruption (wrong Decimal scale, wrong UTF-8 byte order, lost
- * BigInteger sign) ships.
- *
- * Refs: todos/features/gluten-inmemory-cache-stats/docs/0004-layerA-implementation-plan.md PA-5
- * todos/features/gluten-inmemory-cache-stats/backlog.md (phase-2 marshal)
+ * Ship-blocker acceptance tests for the non-BIGINT marshal paths (Decimal short/long, String, Float
+ * / Double NaN guard). Guards against silent corruption (wrong Decimal scale, wrong UTF-8 byte
+ * order, lost BigInteger sign) on round-trip.
  */
 class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
 
   // PA-7 (was PA-5.C): Decimal(10, 2) -- precision <= 18 uses Long backing
-  // in Spark. JVM dispatch marshals 8B unscaled Long; cpp emits Velox BIGINT
-  // physical for short-decimal which round-trips through the LongType wire
-  // path. Schema arg supplies DecimalType(p,s) so deserializeStats can
-  // reconstruct Decimal from unscaled Long.
+
   test("PA-7 Decimal(10, 2) round-trip preserves value") {
     val lo = Decimal(BigDecimal("1.50"), 10, 2)
     val hi = Decimal(BigDecimal("99.99"), 10, 2)
@@ -62,8 +48,7 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
   }
 
   // PA-8 (was PA-5.D): Decimal(30, 5) -- precision > 18 uses BigInteger /
-  // int128 backing (16 bytes). cpp HUGEINT marshal to 16B LE; JVM
-  // reconstructs via signed BE BigInteger.
+
   test("PA-8 Decimal(30, 5) round-trip preserves big value") {
     val big = BigDecimal("12345678901234567890.12345")
     val lo = Decimal(big.bigDecimal.negate(), 30, 5)
@@ -81,10 +66,7 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
   }
 
   // PA-9 (was PA-5.E ship blocker NS3): String byte-wise lex prune.
-  // UTF8String must compare unsigned byte-by-byte; non-ASCII bytes (e.g.
-  // 0xE4 prefix for CJK) test that the marshal preserves byte values exactly.
-  // Encoder truncates to 256B (design 0008 sec 3.1); short strings round-trip
-  // identically.
+
   test("PA-9 String byte-wise lex round-trip preserves UTF-8 bytes") {
     val lo = UTF8String.fromString("apple")
     // UTF-8 bytes for two CJK code points (U+4E2D U+6587) constructed from hex
@@ -139,8 +121,7 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
   }
 
   // PA-9 carry-overflow demote: upper = 300 bytes of 0xFF cannot widen
-  // (carry overflows past byte 0), so encoder demotes supported=0.
-  // Reader returns null lower/upper bounds.
+
   test("PA-9 String carry overflow demotes column to unsupported") {
     val loBytes = new Array[Byte](10)
     java.util.Arrays.fill(loBytes, 0xff.toByte)

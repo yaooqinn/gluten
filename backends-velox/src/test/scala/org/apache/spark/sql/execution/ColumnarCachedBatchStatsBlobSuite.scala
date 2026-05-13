@@ -24,31 +24,15 @@ import org.scalatest.funsuite.AnyFunSuite
 import java.nio.{ByteBuffer, ByteOrder}
 
 /**
- * PA-3.2 RED tests for statsBlob binary framing (replace PA-1 Java Serialization placeholder with
- * cpp-aligned LE marshal).
+ * Tests for statsBlob binary framing (LE throughout, cpp-aligned).
  *
- * Refs:
- *   - todos/features/gluten-inmemory-cache-stats/docs/0002-cpp-stats-contract.md rev 4 sec 3
- *     (statsBlob layout)
- *   - todos/features/gluten-inmemory-cache-stats/docs/0003-jni-binary-framing-reference.md rev 4
- *     sec 3 + sec 4 (per-type marshal)
- *   - cpp/velox/operators/serializer/VeloxColumnarBatchSerializer.cc PA-2.5b (cpp end of the wire)
- *
- * Wire format (LE throughout, BIGINT 1-col scope per PA-3.2):
- *
- * [ numCols: uint32 LE ] per col: [ supported: uint8 ] [ nullCount: uint32 LE ] [ count: uint32 LE
- * ] [ sizeInBytes: uint64 LE ] if supported: [ lowerBoundLen: uint32 LE = 8 ] [ lowerBound: int64
- * LE ] [ upperBoundLen: uint32 LE = 8 ] [ upperBound: int64 LE ]
+ * Wire (BIGINT 1-col): [ numCols: u32 LE ] per col [ supported: u8 | nullCount: u32 | count: u32 |
+ * sizeInBytes: u64 ] if supported [ lowerLen: u32 | lower bytes | upperLen: u32 | upper bytes ].
  */
 class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
 
-  // PA-3.2.A RED: statsBlob produced by serializeStats matches the cpp-aligned
-  // binary layout byte-for-byte. Pre-PA-3.2, serializeStats wrote Java
-  // Serialization output (gibberish to a binary parser).
-  //
-  // Expected RED failure: the first few bytes of serializeStats output will be
-  // the Java Serialization magic [0xAC, 0xED, ...], not the LE numCols=1 we
-  // expect. assert fails with a clear diff.
+  // PA-3.2.A statsBlob produced by serializeStats matches the cpp-aligned
+
   test("PA-3.2.A statsBlob LE numCols + BIGINT cell round-trip byte-for-byte") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
@@ -79,9 +63,8 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
       "statsBlob must match cpp-aligned LE wire format byte-for-byte")
   }
 
-  // PA-3.2.B RED: round-trip serializeStats -> deserializeStats yields an
-  // InternalRow with 5 slots in vanilla order (lowerBound, upperBound,
-  // nullCount, count, sizeInBytes).
+  // PA-3.2.B round-trip serializeStats -> deserializeStats yields an
+
   test("PA-3.2.B serializeStats then deserializeStats round-trip BIGINT 1-col") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](-7L, 999L, 3, 100, 1024L))
@@ -96,9 +79,8 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
     assert(read.getLong(4) === 1024L, "sizeInBytes at slot 4")
   }
 
-  // PA-3.2.C RED: corrupt blob (numCols=huge) should fail eagerly with a clear
-  // require error, NOT NPE / silent bad row. Guards against silent corruption
-  // from a malformed cpp wire or truncated read.
+  // PA-3.2.C corrupt blob (numCols=huge) should fail eagerly with a clear
+
   test("PA-3.2.C corrupt statsBlob (numCols out of range) fails eagerly") {
     // Craft a blob claiming numCols=Int.MaxValue: 0xFF FF FF 7F
     val corruptNumCols = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)

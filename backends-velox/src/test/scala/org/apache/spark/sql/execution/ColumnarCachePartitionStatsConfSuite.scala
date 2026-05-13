@@ -21,14 +21,9 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.spark.SparkFunSuite
 
 /**
- * PA-4 default-off ship gate.
- *
- * Verifies the SQLConf exists, has the right key/default, and the doc text states the default-off
- * rationale. The write-path branch behavior (conf=true routes through serializeWithStats,
- * conf=false falls back to legacy serialize) is anchored end-to-end by ColumnarCachedBatchE2ESuite
- * under fork CI.
- *
- * Refs: todos/features/gluten-inmemory-cache-stats/docs/0004-layerA-implementation-plan.md PA-4
+ * Verifies the partition-stats SQLConf key, default-off, and doc text. End-to-end branch behavior
+ * (conf=true -> serializeWithStats, conf=false -> legacy serialize) is anchored by
+ * ColumnarCachedBatchE2ESuite under fork CI.
  */
 class ColumnarCachePartitionStatsConfSuite extends SparkFunSuite {
   test("PA-4.A conf key and default-off") {
