@@ -340,4 +340,36 @@ class ColumnarCachedBatchE2ESuite
       cached.unpersist()
     }
   }
+
+  // PA-9 e2e String prune sentinel. cpp scanMinMax<StringView> + variant
+  // owning copy, JVM PA-9 read with 256B truncate. Build N keys k_0000 .. k_0999
+  // (lex-sortable so range partitioning gives disjoint string intervals);
+  // pivot at k_0500 falls inside one partition.
+  test("PA-9 String column equality filter: prune via byte-unsigned stats") {
+    val cached = spark
+      .range(N)
+      .selectExpr("concat('k_', lpad(cast(id as string), 4, '0')) as s")
+      .repartitionByRange(P, col("s"))
+      .cache()
+    try {
+      cached.count() // materialize -- triggers cpp VARCHAR computeStats path
+      val pivotStr = "k_0500"
+      val df = cached.filter(col("s") === pivotStr)
+      val result = df.count()
+      assert(result == 1L, s"expected exactly one row matching string pivot, got $result")
+      val plan = df.queryExecution.executedPlan
+      val ims = find(plan) {
+        case _: InMemoryTableScanExec => true
+        case _ => false
+      }.get.asInstanceOf[InMemoryTableScanExec]
+      val outRows = ims.metrics("numOutputRows").value
+      val upperBound = (N / P) * 2
+      assert(
+        outRows <= upperBound,
+        s"numOutputRows=$outRows expected <= $upperBound (String prune ineffective)"
+      )
+    } finally {
+      cached.unpersist()
+    }
+  }
 }

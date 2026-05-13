@@ -277,6 +277,28 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
         }
         break;
       }
+      case TypeKind::VARCHAR: {
+        // PA-9: VARCHAR scan via StringView. StringView::operator<=>
+        // (StringView.h:219) uses memcmp -> unsigned byte ordering, matching
+        // Spark ByteArray.compareBinary which uses Byte.toUnsignedInt + 0xFF
+        // (ByteArray.java). variant(std::string{sv}) heap-allocates and owns
+        // the bytes (Variant.h:232), so the StringView's pointer-into-
+        // FlatVector-buffer lifetime is not a concern after computeStats
+        // returns. cpp does NOT truncate -- JVM PA-9 truncates to 256B on
+        // read with carry-overflow demote (design 0008 sec 3.1).
+        auto* flat = child->asFlatVector<StringView>();
+        StringView lo, hi;
+        supported = scanMinMax<StringView>(flat, lo, hi, nullCnt, seen);
+        if (supported && seen) {
+          stats.hasLowerBound = true;
+          stats.hasUpperBound = true;
+          // Force std::string copy to own the bytes; std::string ctor
+          // takes (const char*, size_t).
+          stats.lowerBound = variant(std::string(lo.data(), lo.size()));
+          stats.upperBound = variant(std::string(hi.data(), hi.size()));
+        }
+        break;
+      }
       default:
         // Other types deferred to later micro-slices (Integer / Double / String /
         // Decimal). hasLowerBound=hasUpperBound=false => buildFilter pass-through.
@@ -332,7 +354,8 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
          kind == facebook::velox::TypeKind::REAL ||
          kind == facebook::velox::TypeKind::DOUBLE ||
          kind == facebook::velox::TypeKind::BOOLEAN ||
-         kind == facebook::velox::TypeKind::TIMESTAMP);
+         kind == facebook::velox::TypeKind::TIMESTAMP ||
+         kind == facebook::velox::TypeKind::VARCHAR);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     pushU32(numRows);  // PA-6.5 B3 (corrected post-Layer-2 #2): vanilla
@@ -429,6 +452,23 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
           pushI64LE(s.lowerBound.value<facebook::velox::Timestamp>().toMicros());
           pushU32(8);
           pushI64LE(s.upperBound.value<facebook::velox::Timestamp>().toMicros());
+          break;
+        }
+        case facebook::velox::TypeKind::VARCHAR: {
+          // PA-9: emit as len u32 LE + raw UTF-8 bytes. cpp does NOT
+          // truncate; JVM PA-9 applies 256B truncate + carry-overflow
+          // demote on read (design 0008 sec 3.1). variant.value<VARCHAR>()
+          // returns a std::string& (owned).
+          const auto& loStr = s.lowerBound.value<facebook::velox::TypeKind::VARCHAR>();
+          const auto& hiStr = s.upperBound.value<facebook::velox::TypeKind::VARCHAR>();
+          pushU32(static_cast<uint32_t>(loStr.size()));
+          for (auto c : loStr) {
+            pushU8(static_cast<uint8_t>(c));
+          }
+          pushU32(static_cast<uint32_t>(hiStr.size()));
+          for (auto c : hiStr) {
+            pushU8(static_cast<uint8_t>(c));
+          }
           break;
         }
         default:

@@ -488,4 +488,75 @@ TEST_F(VeloxColumnarBatchSerializerTest, PA_6_2_E_2_testFramedSerializeWithStats
       << "TIMESTAMP wire lowerBound microseconds mismatch";
 }
 
+// PA-9 RED: VARCHAR FlatVector min/max scan via StringView.
+// StringView::compare() uses memcmp -> unsigned byte ordering, matching
+// Spark ByteArray.compareBinary which uses Byte.toUnsignedInt + 0xFF
+// (ByteArray.java:67-90). variant(std::string) takes ownership so the
+// StringView's pointer-into-FlatVector-buffer lifetime is not a concern
+// after computeStats returns (Variant.h:232 heap-allocates new std::string).
+TEST_F(VeloxColumnarBatchSerializerTest, PA_9_testComputeStatsVarcharFlatVector) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // Test inputs include high-bit byte (0xC2) to confirm unsigned comparison
+  // (signed cmp would put 0xC2 < 'a' = 0x61, wrong).
+  std::vector<VectorPtr> children = {
+      makeFlatVector<StringView>({StringView("apple"),
+                                  StringView("banana"),
+                                  StringView("\xc2\xa9" "copy")})};
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound)
+      << "VARCHAR FlatVector must be supported after PA-9 GREEN";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  // Unsigned byte order: "apple"(0x61) < "banana"(0x62) < "\xc2\xa9copy"(0xc2).
+  EXPECT_EQ(stats[0].lowerBound.value<TypeKind::VARCHAR>(), std::string("apple"));
+  EXPECT_EQ(stats[0].upperBound.value<TypeKind::VARCHAR>(),
+            std::string("\xc2\xa9" "copy"));
+  EXPECT_EQ(stats[0].nullCount, 0);
+}
+
+// PA-9.2 RED: VARCHAR wire marshaling via framedSerializeWithStats.
+// Wire shape per docs/0008 sec 3.1: lowerLen u32 LE + N bytes raw UTF-8.
+// cpp does NOT truncate (JVM truncates to 256B on read), so cpp wire is
+// the full byte sequence.
+TEST_F(VeloxColumnarBatchSerializerTest, PA_9_2_testFramedSerializeWithStatsVarchar) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeFlatVector<StringView>({StringView("apple"), StringView("banana")})};
+  auto rowVector = makeRowVector(children);
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+  auto framed = serializer->framedSerializeWithStats(batch);
+
+  // Skip MAGIC (4) + statsLen (4); statsBlob starts at offset 8.
+  ASSERT_GE(framed.size(), 8u);
+  const uint8_t* p = framed.data() + 8;
+  // numCols = 1
+  EXPECT_EQ(p[0], 1u);
+  p += 4;
+  // supported = 1
+  EXPECT_EQ(p[0], 1u) << "VARCHAR column should emit supported=1";
+  p += 1;
+  // skip nullCount + count + sizeInBytes (4 + 4 + 8)
+  p += 4 + 4 + 8;
+  // lowerLen = 5 (apple)
+  uint32_t lowerLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(lowerLen, 5u) << "VARCHAR lowerLen should be 5 for 'apple'";
+  p += 4;
+  std::string lower(reinterpret_cast<const char*>(p), 5);
+  EXPECT_EQ(lower, "apple") << "VARCHAR lowerBound bytes mismatch";
+  p += 5;
+  // upperLen = 6 (banana)
+  uint32_t upperLen = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+  EXPECT_EQ(upperLen, 6u) << "VARCHAR upperLen should be 6 for 'banana'";
+  p += 4;
+  std::string upper(reinterpret_cast<const char*>(p), 6);
+  EXPECT_EQ(upper, "banana") << "VARCHAR upperBound bytes mismatch";
+}
+
 } // namespace gluten
