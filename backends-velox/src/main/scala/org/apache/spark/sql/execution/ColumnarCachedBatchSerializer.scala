@@ -28,19 +28,27 @@ import org.apache.gluten.vectorized.ColumnarBatchSerializerJniWrapper
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, GenericInternalRow}
 import org.apache.spark.sql.columnar.{CachedBatch, SimpleMetricsCachedBatch, SimpleMetricsCachedBatchSerializer}
 import org.apache.spark.sql.execution.columnar.DefaultCachedBatchSerializer
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.utils.SparkArrowUtil
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.unsafe.types.UTF8String
 
 import com.esotericsoftware.kryo.{Kryo, Serializer => KryoSerializer}
 import com.esotericsoftware.kryo.DefaultSerializer
 import com.esotericsoftware.kryo.io.{Input, Output}
 import org.apache.arrow.c.ArrowSchema
+
+import java.io.ByteArrayOutputStream
+import java.lang.{Double => JDouble, Float => JFloat}
+import java.math.{BigDecimal => JBigDecimal, BigInteger}
+import java.nio.{ByteBuffer, ByteOrder}
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.Arrays
 
 /**
  * TODO: fix on Spark-4.1 - Documentation
@@ -74,7 +82,7 @@ case class CachedColumnarBatch(
     // serializeStats / deserializeStats by source-column dataType (vanilla full-type
     // alignment per design 0008 D-A5). Nullable for v1 binary back-compat
     // (legacy stats=null cache batches have no schema either).
-    schema: org.apache.spark.sql.types.StructType = null)
+    schema: StructType = null)
   extends SimpleMetricsCachedBatch
 
 /**
@@ -149,7 +157,7 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     } else {
       output.writeBoolean(true)
       val schemaJson = batch.schema.json
-      val schemaBytes = schemaJson.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      val schemaBytes = schemaJson.getBytes(UTF_8)
       output.writeInt(schemaBytes.length)
       output.writeBytes(schemaBytes)
     }
@@ -161,9 +169,9 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       cls: Class[CachedColumnarBatch]): CachedColumnarBatch = {
     val first4 = new Array[Byte](4)
     input.readBytes(first4)
-    if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V3_MAGIC)) {
+    if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V3_MAGIC)) {
       readV3(input)
-    } else if (java.util.Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
+    } else if (Arrays.equals(first4, CachedColumnarBatchKryoSerializer.V2_MAGIC)) {
       // PA-6.5 D1: V2 readers (no schema tail) preserved for rolling-deploy
       // compatibility. Old executor stream still parsable; schema=null path
       // falls back to legacy BIGINT-only behavior in deserializeStats.
@@ -190,7 +198,7 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
     // NOTE: avoid `val (a: T, b: U) = ...` tuple destructuring with type
     // ascription -- Scala 2.13 erases the Tuple2 generics and a typed-pattern
     // match against `Tuple2` throws MatchError at runtime.
-    val statsAndSchema: (InternalRow, org.apache.spark.sql.types.StructType) = if (hasStats) {
+    val statsAndSchema: (InternalRow, StructType) = if (hasStats) {
       val statsLen = input.readInt()
       val statsBytes = new Array[Byte](statsLen)
       input.readBytes(statsBytes)
@@ -199,9 +207,9 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
         val schemaLen = input.readInt()
         val schemaBytes = new Array[Byte](schemaLen)
         input.readBytes(schemaBytes)
-        org.apache.spark.sql.types.DataType
-          .fromJson(new String(schemaBytes, java.nio.charset.StandardCharsets.UTF_8))
-          .asInstanceOf[org.apache.spark.sql.types.StructType]
+        DataType
+          .fromJson(new String(schemaBytes, UTF_8))
+          .asInstanceOf[StructType]
       } else {
         null
       }
@@ -214,9 +222,9 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
         val schemaLen = input.readInt()
         val schemaBytes = new Array[Byte](schemaLen)
         input.readBytes(schemaBytes)
-        org.apache.spark.sql.types.DataType
-          .fromJson(new String(schemaBytes, java.nio.charset.StandardCharsets.UTF_8))
-          .asInstanceOf[org.apache.spark.sql.types.StructType]
+        DataType
+          .fromJson(new String(schemaBytes, UTF_8))
+          .asInstanceOf[StructType]
       } else {
         null
       }
@@ -311,33 +319,33 @@ object CachedColumnarBatchKryoSerializer {
   // preventing cpp-emitted stats (e.g. short-Decimal as Velox BIGINT) from
   // causing UnsupportedOperationException in JVM dispatch. Decimal/String/
   // Bool/Float/Double/Timestamp/TimestampNTZ land in PA-7..PA-10.
-  private[execution] def isDispatchable(dt: org.apache.spark.sql.types.DataType): Boolean =
+  private[execution] def isDispatchable(dt: DataType): Boolean =
     dt match {
-      case org.apache.spark.sql.types.IntegerType
-          | org.apache.spark.sql.types.DateType
-          | _: org.apache.spark.sql.types.YearMonthIntervalType => true
-      case org.apache.spark.sql.types.ShortType => true
-      case org.apache.spark.sql.types.ByteType => true
-      case org.apache.spark.sql.types.LongType
-          | _: org.apache.spark.sql.types.DayTimeIntervalType
-          | org.apache.spark.sql.types.TimestampType
-          | org.apache.spark.sql.types.TimestampNTZType => true
+      case IntegerType
+          | DateType
+          | _: YearMonthIntervalType => true
+      case ShortType => true
+      case ByteType => true
+      case LongType
+          | _: DayTimeIntervalType
+          | TimestampType
+          | TimestampNTZType => true
       // PA-7: short-decimal (p<=18) uses Long unscaled backing; long-decimal
       // (p>18) lands in PA-8 with int128 path.
-      case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 => true
+      case d: DecimalType if d.precision <= 18 => true
       // PA-8: long-decimal (p>18) uses BigInteger backing; marshal as 16B LE
       // signed two's-complement. Velox short-vs-long boundary aligns at p=18
       // (Spark) and physical TypeKind::HUGEINT.
-      case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 => true
+      case d: DecimalType if d.precision <= 38 => true
       // PA-10: Float (4B IEEE 754) / Double (8B) / Boolean (1B). NaN guard
       // lives in cpp scanMinMax (returns supported=false on first NaN).
-      case org.apache.spark.sql.types.FloatType => true
-      case org.apache.spark.sql.types.DoubleType => true
-      case org.apache.spark.sql.types.BooleanType => true
+      case FloatType => true
+      case DoubleType => true
+      case BooleanType => true
       // PA-9: variable-length UTF-8 bytes. Truncated to 256B on emit (design
       // 0008 sec 3.1); reader is length-prefix driven so longer fallback widths
       // (rare carry-overflow path) round-trip safely.
-      case org.apache.spark.sql.types.StringType => true
+      case StringType => true
       case _ => false
     }
 
@@ -349,14 +357,14 @@ object CachedColumnarBatchKryoSerializer {
   // PA-3.2 BIGINT-only behavior (backward compatible).
   private[execution] def serializeStats(
       stats: InternalRow,
-      schema: org.apache.spark.sql.types.StructType): Array[Byte] = {
+      schema: StructType): Array[Byte] = {
     require(
       stats.numFields % 5 == 0,
       s"stats InternalRow numFields=${stats.numFields} must be a multiple of 5 " +
         s"(vanilla PartitionStatistics schema = 5 slots per column)"
     )
     val numCols = stats.numFields / 5
-    val baos = new java.io.ByteArrayOutputStream()
+    val baos = new ByteArrayOutputStream()
     writeU32LE(baos, numCols)
     var col = 0
     while (col < numCols) {
@@ -374,7 +382,7 @@ object CachedColumnarBatchKryoSerializer {
       // 0008 sec 3.1: truncate to 256B, upper-bound +1 byte-wise carry; if carry
       // overflows (all-0xFF prefix) the upper cannot widen, so we demote.
       val isStringCol = (schema != null) && hasLower && hasUpper &&
-        (schema(col).dataType eq org.apache.spark.sql.types.StringType)
+        (schema(col).dataType eq StringType)
       val stringPayload: Option[(Array[Byte], Array[Byte])] =
         if (isStringCol) {
           val loB = stats.getUTF8String(base).getBytes
@@ -393,12 +401,12 @@ object CachedColumnarBatchKryoSerializer {
         // count, sizeInBytes) where lowerBound/upperBound carry the SOURCE
         // column dataType (see ~/spark/.../ColumnStats.scala line 25-32).
         // schema==null => legacy BIGINT-only behavior (PA-3.2).
-        val dt: org.apache.spark.sql.types.DataType =
-          if (schema == null) org.apache.spark.sql.types.LongType else schema(col).dataType
+        val dt: DataType =
+          if (schema == null) LongType else schema(col).dataType
         dt match {
-          case org.apache.spark.sql.types.IntegerType
-              | org.apache.spark.sql.types.DateType
-              | _: org.apache.spark.sql.types.YearMonthIntervalType =>
+          case IntegerType
+              | DateType
+              | _: YearMonthIntervalType =>
             // PA-6.A: 4 LE bytes signed Int.
             // PA-6.G.1: DateType physically Int (days since epoch).
             // PA-6.F.1: YearMonthIntervalType physically Int (months).
@@ -408,22 +416,22 @@ object CachedColumnarBatchKryoSerializer {
             writeU32LE(baos, stats.getInt(base))
             writeU32LE(baos, 4)
             writeU32LE(baos, stats.getInt(base + 1))
-          case org.apache.spark.sql.types.ShortType =>
+          case ShortType =>
             // writeU16LE writes 2 LE bytes; signed Short has identical bit pattern.
             writeU32LE(baos, 2)
             writeU16LE(baos, stats.getShort(base) & 0xffff)
             writeU32LE(baos, 2)
             writeU16LE(baos, stats.getShort(base + 1) & 0xffff)
-          case org.apache.spark.sql.types.ByteType =>
+          case ByteType =>
             // 1 byte, signed.
             writeU32LE(baos, 1)
             baos.write(stats.getByte(base) & 0xff)
             writeU32LE(baos, 1)
             baos.write(stats.getByte(base + 1) & 0xff)
-          case org.apache.spark.sql.types.LongType
-              | org.apache.spark.sql.types.TimestampType
-              | org.apache.spark.sql.types.TimestampNTZType
-              | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+          case LongType
+              | TimestampType
+              | TimestampNTZType
+              | _: DayTimeIntervalType =>
             // PA-3.2: 8 LE bytes signed Long.
             // PA-6.G.2/3: TimestampType / TimestampNTZType physically Long microseconds.
             // PA-6.F.2: DayTimeIntervalType physically Long microseconds.
@@ -434,15 +442,15 @@ object CachedColumnarBatchKryoSerializer {
             writeI64LE(baos, stats.getLong(base))
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base + 1))
-          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 =>
-            // PA-7: short-Decimal stored as org.apache.spark.sql.types.Decimal
+          case d: DecimalType if d.precision <= 18 =>
+            // PA-7: short-Decimal stored as Decimal
             // in stats; toUnscaledLong() is the Long unscaled value (matches
             // Velox short-decimal physical = BIGINT). Marshal 8 LE bytes.
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getDecimal(base, d.precision, d.scale).toUnscaledLong)
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getDecimal(base + 1, d.precision, d.scale).toUnscaledLong)
-          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 =>
+          case d: DecimalType if d.precision <= 38 =>
             // PA-8: long-Decimal (p>18). Marshal 16B LE signed two's-complement
             // unscaled BigInteger. Matches cpp HUGEINT int128 wire (low/high
             // uint64 LE pair).
@@ -452,25 +460,25 @@ object CachedColumnarBatchKryoSerializer {
             writeI128LE(baos, loDec.toJavaBigDecimal.unscaledValue)
             writeU32LE(baos, 16)
             writeI128LE(baos, hiDec.toJavaBigDecimal.unscaledValue)
-          case org.apache.spark.sql.types.FloatType =>
+          case FloatType =>
             // PA-10: 4B IEEE 754 float bits.
             writeU32LE(baos, 4)
-            writeU32LE(baos, java.lang.Float.floatToRawIntBits(stats.getFloat(base)))
+            writeU32LE(baos, JFloat.floatToRawIntBits(stats.getFloat(base)))
             writeU32LE(baos, 4)
-            writeU32LE(baos, java.lang.Float.floatToRawIntBits(stats.getFloat(base + 1)))
-          case org.apache.spark.sql.types.DoubleType =>
+            writeU32LE(baos, JFloat.floatToRawIntBits(stats.getFloat(base + 1)))
+          case DoubleType =>
             // PA-10: 8B IEEE 754 double bits.
             writeU32LE(baos, 8)
-            writeU64LE(baos, java.lang.Double.doubleToRawLongBits(stats.getDouble(base)))
+            writeU64LE(baos, JDouble.doubleToRawLongBits(stats.getDouble(base)))
             writeU32LE(baos, 8)
-            writeU64LE(baos, java.lang.Double.doubleToRawLongBits(stats.getDouble(base + 1)))
-          case org.apache.spark.sql.types.BooleanType =>
+            writeU64LE(baos, JDouble.doubleToRawLongBits(stats.getDouble(base + 1)))
+          case BooleanType =>
             // PA-10: 1B (0/1).
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base)) 1 else 0)
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base + 1)) 1 else 0)
-          case org.apache.spark.sql.types.StringType =>
+          case StringType =>
             // PA-9: variable-length UTF-8. lower = truncated 256B prefix
             // (byte-wise <= original); upper = truncated 256B prefix with
             // last byte +1 carry (byte-wise >= original). encodeStringBounds
@@ -495,13 +503,13 @@ object CachedColumnarBatchKryoSerializer {
   // remains BIGINT-only behavior (schema unused); PA-6.A onwards reads it.
   private[execution] def deserializeStats(
       blob: Array[Byte],
-      schema: org.apache.spark.sql.types.StructType): InternalRow = {
-    val buf = java.nio.ByteBuffer.wrap(blob).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+      schema: StructType): InternalRow = {
+    val buf = ByteBuffer.wrap(blob).order(ByteOrder.LITTLE_ENDIAN)
     val numCols = buf.getInt
     require(
       numCols >= 0 && numCols <= 4096,
       s"corrupt statsBlob: numCols=$numCols out of valid range [0, 4096]")
-    val row = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(numCols * 5)
+    val row = new GenericInternalRow(numCols * 5)
     var col = 0
     while (col < numCols) {
       val base = col * 5
@@ -513,13 +521,13 @@ object CachedColumnarBatchKryoSerializer {
         // PA-6.A: dispatch by source-column dataType. schema==null => legacy
         // BIGINT-only (PA-3.2). lowerLen on the wire still authoritative for
         // payload width; we cross-check against schema dispatch.
-        val dt: org.apache.spark.sql.types.DataType =
-          if (schema == null) org.apache.spark.sql.types.LongType else schema(col).dataType
+        val dt: DataType =
+          if (schema == null) LongType else schema(col).dataType
         val lowerLen = buf.getInt
         dt match {
-          case org.apache.spark.sql.types.IntegerType
-              | org.apache.spark.sql.types.DateType
-              | _: org.apache.spark.sql.types.YearMonthIntervalType =>
+          case IntegerType
+              | DateType
+              | _: YearMonthIntervalType =>
             require(
               lowerLen == 4,
               s"PA-6.A/D/F.1 Integer-family expects 4-byte lowerBound, got $lowerLen")
@@ -529,7 +537,7 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 4,
               s"PA-6.A/D/F.1 Integer-family expects 4-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getInt)
-          case org.apache.spark.sql.types.ShortType =>
+          case ShortType =>
             require(
               lowerLen == 2,
               s"PA-6.B ShortType expects 2-byte lowerBound, got $lowerLen")
@@ -539,7 +547,7 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 2,
               s"PA-6.B ShortType expects 2-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getShort)
-          case org.apache.spark.sql.types.ByteType =>
+          case ByteType =>
             require(
               lowerLen == 1,
               s"PA-6.C ByteType expects 1-byte lowerBound, got $lowerLen")
@@ -549,10 +557,10 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 1,
               s"PA-6.C ByteType expects 1-byte upperBound, got $upperLen")
             row.update(base + 1, buf.get)
-          case org.apache.spark.sql.types.LongType
-              | org.apache.spark.sql.types.TimestampType
-              | org.apache.spark.sql.types.TimestampNTZType
-              | _: org.apache.spark.sql.types.DayTimeIntervalType =>
+          case LongType
+              | TimestampType
+              | TimestampNTZType
+              | _: DayTimeIntervalType =>
             require(
               lowerLen == 8,
               s"PA-3.2/E/G Long-family expects 8-byte lowerBound, got $lowerLen")
@@ -562,22 +570,22 @@ object CachedColumnarBatchKryoSerializer {
               upperLen == 8,
               s"PA-3.2/E/G Long-family expects 8-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getLong)
-          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 18 =>
+          case d: DecimalType if d.precision <= 18 =>
             // PA-7: read 8B unscaled Long, reconstruct Decimal(unscaled, p, s).
             // T1 trap: must wrap as Decimal, NOT raw Long, or
             // SpecificInternalRow.getDecimal ClassCastException at codegen.
             require(
               lowerLen == 8,
               s"PA-7 short-Decimal expects 8-byte lowerBound, got $lowerLen")
-            row.update(base, org.apache.spark.sql.types.Decimal(buf.getLong, d.precision, d.scale))
+            row.update(base, Decimal(buf.getLong, d.precision, d.scale))
             val upperLen = buf.getInt
             require(
               upperLen == 8,
               s"PA-7 short-Decimal expects 8-byte upperBound, got $upperLen")
             row.update(
               base + 1,
-              org.apache.spark.sql.types.Decimal(buf.getLong, d.precision, d.scale))
-          case d: org.apache.spark.sql.types.DecimalType if d.precision <= 38 =>
+              Decimal(buf.getLong, d.precision, d.scale))
+          case d: DecimalType if d.precision <= 38 =>
             // PA-8: read 16B LE signed two's-complement, reconstruct
             // Decimal(BigDecimal(unscaled BigInteger, scale), p, s).
             require(
@@ -587,8 +595,8 @@ object CachedColumnarBatchKryoSerializer {
             buf.get(loBytes)
             row.update(
               base,
-              org.apache.spark.sql.types.Decimal(
-                new java.math.BigDecimal(readI128LE(loBytes), d.scale),
+              Decimal(
+                new JBigDecimal(readI128LE(loBytes), d.scale),
                 d.precision,
                 d.scale))
             val upperLenL = buf.getInt
@@ -599,29 +607,29 @@ object CachedColumnarBatchKryoSerializer {
             buf.get(hiBytes)
             row.update(
               base + 1,
-              org.apache.spark.sql.types.Decimal(
-                new java.math.BigDecimal(readI128LE(hiBytes), d.scale),
+              Decimal(
+                new JBigDecimal(readI128LE(hiBytes), d.scale),
                 d.precision,
                 d.scale))
-          case org.apache.spark.sql.types.FloatType =>
+          case FloatType =>
             require(lowerLen == 4, s"PA-10 FloatType expects 4B lowerBound, got $lowerLen")
-            row.update(base, java.lang.Float.intBitsToFloat(buf.getInt))
+            row.update(base, JFloat.intBitsToFloat(buf.getInt))
             val upperLenF = buf.getInt
             require(upperLenF == 4, s"PA-10 FloatType expects 4B upperBound, got $upperLenF")
-            row.update(base + 1, java.lang.Float.intBitsToFloat(buf.getInt))
-          case org.apache.spark.sql.types.DoubleType =>
+            row.update(base + 1, JFloat.intBitsToFloat(buf.getInt))
+          case DoubleType =>
             require(lowerLen == 8, s"PA-10 DoubleType expects 8B lowerBound, got $lowerLen")
-            row.update(base, java.lang.Double.longBitsToDouble(buf.getLong))
+            row.update(base, JDouble.longBitsToDouble(buf.getLong))
             val upperLenD = buf.getInt
             require(upperLenD == 8, s"PA-10 DoubleType expects 8B upperBound, got $upperLenD")
-            row.update(base + 1, java.lang.Double.longBitsToDouble(buf.getLong))
-          case org.apache.spark.sql.types.BooleanType =>
+            row.update(base + 1, JDouble.longBitsToDouble(buf.getLong))
+          case BooleanType =>
             require(lowerLen == 1, s"PA-10 BooleanType expects 1B lowerBound, got $lowerLen")
             row.update(base, buf.get != 0)
             val upperLenB = buf.getInt
             require(upperLenB == 1, s"PA-10 BooleanType expects 1B upperBound, got $upperLenB")
             row.update(base + 1, buf.get != 0)
-          case org.apache.spark.sql.types.StringType =>
+          case StringType =>
             // PA-9: variable-length UTF-8 bytes. lowerLen on wire is
             // authoritative (truncated to 256B by encoder, may be 0 only
             // when supported=0 -- this branch already inside supported==1).
@@ -630,14 +638,14 @@ object CachedColumnarBatchKryoSerializer {
               s"PA-9 StringType expects lowerBound in [0, 256], got $lowerLen")
             val loBytes = new Array[Byte](lowerLen)
             buf.get(loBytes)
-            row.update(base, org.apache.spark.unsafe.types.UTF8String.fromBytes(loBytes))
+            row.update(base, UTF8String.fromBytes(loBytes))
             val upperLenS = buf.getInt
             require(
               upperLenS >= 0 && upperLenS <= 256,
               s"PA-9 StringType expects upperBound in [0, 256], got $upperLenS")
             val hiBytes = new Array[Byte](upperLenS)
             buf.get(hiBytes)
-            row.update(base + 1, org.apache.spark.unsafe.types.UTF8String.fromBytes(hiBytes))
+            row.update(base + 1, UTF8String.fromBytes(hiBytes))
           case other =>
             // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
             // BIGINT physical) or other types not yet in JVM dispatch.
@@ -660,19 +668,19 @@ object CachedColumnarBatchKryoSerializer {
     row
   }
 
-  private def writeU16LE(out: java.io.ByteArrayOutputStream, v: Int): Unit = {
+  private def writeU16LE(out: ByteArrayOutputStream, v: Int): Unit = {
     out.write(v & 0xff)
     out.write((v >>> 8) & 0xff)
   }
 
-  private def writeU32LE(out: java.io.ByteArrayOutputStream, v: Int): Unit = {
+  private def writeU32LE(out: ByteArrayOutputStream, v: Int): Unit = {
     out.write(v & 0xff)
     out.write((v >>> 8) & 0xff)
     out.write((v >>> 16) & 0xff)
     out.write((v >>> 24) & 0xff)
   }
 
-  private def writeU64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit = {
+  private def writeU64LE(out: ByteArrayOutputStream, v: Long): Unit = {
     var i = 0
     while (i < 8) {
       out.write(((v >>> (8 * i)) & 0xffL).toInt)
@@ -680,13 +688,13 @@ object CachedColumnarBatchKryoSerializer {
     }
   }
 
-  private def writeI64LE(out: java.io.ByteArrayOutputStream, v: Long): Unit =
+  private def writeI64LE(out: ByteArrayOutputStream, v: Long): Unit =
     writeU64LE(out, v)
 
   // PA-8: write 16B LE signed two's-complement representation of a BigInteger.
   // BigInteger.toByteArray() returns big-endian signed bytes (minimal width);
   // sign-extend to 16 and reverse. Throws if value doesn't fit in int128.
-  private def writeI128LE(out: java.io.ByteArrayOutputStream, v: java.math.BigInteger): Unit = {
+  private def writeI128LE(out: ByteArrayOutputStream, v: BigInteger): Unit = {
     val raw = v.toByteArray // BE signed two's-complement
     require(raw.length <= 16, s"PA-8 BigInteger does not fit int128 (${raw.length} bytes)")
     val padded = new Array[Byte](16)
@@ -709,7 +717,7 @@ object CachedColumnarBatchKryoSerializer {
   }
 
   // PA-8: read 16B LE signed two's-complement back into BigInteger.
-  private def readI128LE(le: Array[Byte]): java.math.BigInteger = {
+  private def readI128LE(le: Array[Byte]): BigInteger = {
     require(le.length == 16, s"PA-8 readI128LE expects 16 bytes, got ${le.length}")
     val be = new Array[Byte](16)
     var i = 0
@@ -717,7 +725,7 @@ object CachedColumnarBatchKryoSerializer {
       be(i) = le(15 - i)
       i += 1
     }
-    new java.math.BigInteger(be) // signed BE constructor
+    new BigInteger(be) // signed BE constructor
   }
 
   // PA-9: encode (lo, hi) string bounds for wire. Truncate each to 256 bytes
@@ -732,14 +740,14 @@ object CachedColumnarBatchKryoSerializer {
       loBytes: Array[Byte],
       hiBytes: Array[Byte]): Option[(Array[Byte], Array[Byte])] = {
     val loLen = math.min(loBytes.length, PA9_STRING_TRUNCATE_LEN)
-    val loEnc = java.util.Arrays.copyOf(loBytes, loLen)
+    val loEnc = Arrays.copyOf(loBytes, loLen)
     val hiSrcLen = math.min(hiBytes.length, PA9_STRING_TRUNCATE_LEN)
     // If the original upper fit entirely, no carry needed; emit as-is.
     if (hiBytes.length <= PA9_STRING_TRUNCATE_LEN) {
-      Some((loEnc, java.util.Arrays.copyOf(hiBytes, hiSrcLen)))
+      Some((loEnc, Arrays.copyOf(hiBytes, hiSrcLen)))
     } else {
       // Truncated; need +1 carry on the prefix to ensure encoded >= original.
-      val hiEnc = java.util.Arrays.copyOf(hiBytes, PA9_STRING_TRUNCATE_LEN)
+      val hiEnc = Arrays.copyOf(hiBytes, PA9_STRING_TRUNCATE_LEN)
       var i = PA9_STRING_TRUNCATE_LEN - 1
       while (i >= 0) {
         val b = (hiEnc(i) & 0xff) + 1
@@ -771,7 +779,7 @@ object CachedColumnarBatchKryoSerializer {
    */
   private[execution] def parseFramedBytes(
       framed: Array[Byte],
-      schema: org.apache.spark.sql.types.StructType): (InternalRow, Array[Byte]) = {
+      schema: StructType): (InternalRow, Array[Byte]) = {
     require(
       framed != null && framed.length >= 4 + 4 + 4,
       s"framed bytes too short: len=${if (framed == null) -1 else framed.length}")
@@ -784,7 +792,7 @@ object CachedColumnarBatchKryoSerializer {
         f"0x${framed(0) & 0xff}%02X${framed(1) & 0xff}%02X" +
         f"${framed(2) & 0xff}%02X${framed(3) & 0xff}%02X"
     )
-    val buf = java.nio.ByteBuffer.wrap(framed).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+    val buf = ByteBuffer.wrap(framed).order(ByteOrder.LITTLE_ENDIAN)
     buf.position(4) // skip magic
     val statsLen = buf.getInt
     require(
@@ -952,10 +960,10 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
               val framed = jni.serializeWithStats(handle)
               // PA-6.0: convert Seq[Attribute] to StructType once and carry per-batch
               // so Kryo (spill / disk cache) read path can dispatch by dataType.
-              val structSchema = org.apache.spark.sql.types.StructType(
+              val structSchema = StructType(
                 schema.map(
                   a =>
-                    org.apache.spark.sql.types.StructField(a.name, a.dataType, a.nullable)))
+                    StructField(a.name, a.dataType, a.nullable)))
               val (stats, bytesBlob) =
                 CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, structSchema)
               CachedColumnarBatch(batch.numRows(), bytesBlob.length, bytesBlob, stats, structSchema)
