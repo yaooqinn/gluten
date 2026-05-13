@@ -51,26 +51,21 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.util.Arrays
 
 /**
- * TODO: fix on Spark-4.1 - Documentation
+ * A Velox columnar cache batch carrying per-partition column statistics.
  *
- * If you encounter serialization issues, manually register this class:
+ * `stats` follows the [[SimpleMetricsCachedBatch]] contract (SPARK-32274): per-column slots
+ * `(lowerBound, upperBound, nullCount, count, sizeInBytes)`. `null` means stats are unavailable
+ * (legacy V1 binary, or partition-stats SQLConf disabled); the serializer's `buildFilter` override
+ * directs such batches through unchanged to avoid NPE in vanilla
+ * `SimpleMetricsCachedBatchSerializer.buildFilter` on `partitionFilter.eval(null)`.
+ *
+ * `sizeInBytes` is the serialized blob length (Velox off-heap footprint), overriding the trait's
+ * default per-column sum so cache-eviction accounting matches actual memory.
+ *
+ * Manual Kryo registration (Spark 4.1 doc TODO):
  * {{{
  *   spark.kryo.classesToRegister=org.apache.spark.sql.execution.CachedColumnarBatch
  * }}}
- *
- * `stats` carries per-partition column statistics (min/max/nullCount/count/sizeInBytes per
- * supported column) per the SimpleMetricsCachedBatch contract (SPARK-32274). `null` indicates stats
- * unavailable (e.g. v1 binary read or stats compute disabled); the serializer's buildFilter
- * override uses a lazy-split iterator wrapper to direct stats=null batches through (skipping
- * vanilla partition pruning) -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` would NPE
- * on `partitionFilter.eval(null)` for non-trivial predicates (both codegen and interpreted paths;
- * no fallback). See todos/features/gluten-inmemory-cache-stats/investigations/
- * 0003-simplemetrics-buildfilter-survey.md rev 2 for the spark-shell evidence.
- *
- * Use eager `val` (not `lazy val`) for stats to keep Kryo round-trip deterministic. Note: trait
- * SimpleMetricsCachedBatch's default `sizeInBytes` sums per-column stats slots; we override with
- * the serialized blob length here for cache eviction accounting (Velox JNI serialize byte[] length
- * is the real off-heap footprint), not vanilla per-column-sum semantics.
  */
 @DefaultSerializer(classOf[CachedColumnarBatchKryoSerializer])
 case class CachedColumnarBatch(
@@ -78,53 +73,32 @@ case class CachedColumnarBatch(
     override val sizeInBytes: Long,
     bytes: Array[Byte],
     override val stats: InternalRow,
-    // PA-6.0: schema carried per-batch so Kryo read path can dispatch
-    // serializeStats / deserializeStats by source-column dataType (vanilla full-type
-    // alignment per design 0008 D-A5). Nullable for v1 binary back-compat
-    // (legacy stats=null cache batches have no schema either).
+    // Schema is carried per-batch so Kryo read path can dispatch (de)serializeStats by source
+    // dataType. Nullable for V1 binary back-compat.
     schema: StructType = null)
   extends SimpleMetricsCachedBatch
 
 /**
  * Kryo serializer for [[CachedColumnarBatch]] with magic-prefix versioning.
  *
- * v2 binary layout (current):
+ * V3 layout (current, schema-bearing):
  * {{{
- *   [V2_MAGIC: 4 bytes 0xFE 0xCA 0x53 0x02]
- *   [numRows: Int (Kryo fixed 4-byte BIG-ENDIAN, via Output.writeInt(int))]
+ *   [V3_MAGIC: 0xFE 0xCA 0x53 0x03]
+ *   [numRows: Int]                  // Kryo fixed 4-byte BE (single-arg writeInt)
  *   [sizeInBytes: Long]
- *   [bytes.length+1: Int (Kryo fixed 4-byte BE, +1 to distinguish Kryo.NULL)]
- *   [bytes: bytes.length bytes]
- *   [hasStats: Boolean]
- *   if hasStats:
- *     [statsLen: Int]
- *     [statsBytes: statsLen bytes -- Layer A PA-3 will define statsBlob layout
- *      (see contract 0002 sec 3 + reference 0003 sec 3-4); PA-1 always writes stats=null]
- * }}}
- *
- * v1 binary layout (legacy, no stats field, pre-PA-1):
- * {{{
- *   [numRows: Int (Kryo fixed 4-byte BE)]
- *   [sizeInBytes: Long]
- *   [bytes.length+1: Int]
+ *   [bytes.length + 1: Int]         // +1 distinguishes Kryo.NULL
  *   [bytes]
+ *   [hasStats: Boolean]  if true: [statsLen: Int] [statsBlob]
+ *   [hasSchema: Boolean] if true: [schemaLen: Int] [schemaJsonBytes]
  * }}}
  *
- * Read path uses 4-byte magic-prefix sniff. Magic `0xFECA5302` cannot collide with any v1 binary:
- * v1's first 4 bytes are numRows (Kryo fixed 4-byte BE), and any non-negative Int < 2^31 has BE
- * high byte (= `(numRows >>> 24) & 0xff`) in [0x00, 0x7F]. The magic's first byte 0xFE > 0x7F is
- * unreachable, so any v1 binary's first byte is <= 0x7F < 0xFE -- disjoint from the magic.
+ * V2 layout (no schema tail) and V1 layout (no magic, no stats) are still readable for
+ * rolling-deploy / cross-version compat. V2-read passes `schema=null` so deserializeStats falls
+ * back to the legacy BIGINT-only path; V1-read produces `stats=null`.
  *
- * v1 binary read produces stats=null -> buildFilter override uses lazy-split iterator wrapper to
- * direct such batches through, skipping vanilla partition pruning (Spark Streaming checkpoint
- * cross-version safe). NOTE: the prior comment "falls back to pass-through (graceful degrade)" was
- * wrong -- vanilla `SimpleMetricsCachedBatchSerializer.buildFilter` NPEs on
- * `partitionFilter.eval(null)`. See investigations/0003 rev 2 for evidence.
- *
- * NOTE (PA-1 scope): PA-1 write path always emits stats=null (see L347-350). The hasStats=true
- * branch + serializeStats/deserializeStats placeholders are inert in PA-1; PA-3 will (a) populate
- * stats from cpp computeStats output, (b) replace serializeStats placeholder with statsBlob binary
- * framing.
+ * Magic disjointness from V1: a V1 stream's first 4 bytes are `numRows` (Kryo fixed 4-byte BE); any
+ * non-negative Int < 2^31 has high byte in [0x00, 0x7F], so the magic's high byte 0xFE > 0x7F is
+ * structurally unreachable.
  */
 class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBatch] {
 
@@ -814,36 +788,10 @@ object CachedColumnarBatchKryoSerializer {
   }
 }
 
-// format: off
 /**
- * Feature:
- * 1. This serializer supports column pruning
- * 2. TODO: support push down filter
- * 3. Super TODO: support store offheap object directly
- *
- * The data transformation pipeline:
- *
- *   - Serializer ColumnarBatch -> CachedColumnarBatch
- *     -> serialize to byte[]
- *
- *   - Deserializer CachedColumnarBatch -> ColumnarBatch
- *     -> deserialize to byte[] to create Velox ColumnarBatch
- *
- *   - Serializer InternalRow -> CachedColumnarBatch (support RowToColumnar)
- *     -> Convert InternalRow to ColumnarBatch
- *     -> Serializer ColumnarBatch -> CachedColumnarBatch
- *
- *   - Serializer InternalRow -> DefaultCachedBatch (unsupport RowToColumnar)
- *     -> Convert InternalRow to DefaultCachedBatch using vanilla Spark serializer
- *
- *   - Deserializer CachedColumnarBatch -> InternalRow (support ColumnarToRow)
- *     -> Deserializer CachedColumnarBatch -> ColumnarBatch
- *     -> Convert ColumnarBatch to InternalRow
- *
- *   - Deserializer DefaultCachedBatch -> InternalRow (unsupport ColumnarToRow)
- *     -> Convert DefaultCachedBatch to InternalRow using vanilla Spark serializer
+ * Velox columnar cache serializer. Supports column pruning; converts row-based input via
+ * [[RowToVeloxColumnarExec]] and falls back to vanilla Spark serialization for unsupported schemas.
  */
-// format: on
 class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
   private lazy val rowBasedCachedBatchSerializer = new DefaultCachedBatchSerializer
 
