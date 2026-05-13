@@ -300,10 +300,30 @@ object CachedColumnarBatchKryoSerializer {
       writeU32LE(baos, if (stats.isNullAt(base + 3)) 0 else stats.getInt(base + 3))
       writeU64LE(baos, if (stats.isNullAt(base + 4)) 0L else stats.getLong(base + 4))
       if (supported) {
-        writeU32LE(baos, 8)
-        writeI64LE(baos, stats.getLong(base))
-        writeU32LE(baos, 8)
-        writeI64LE(baos, stats.getLong(base + 1))
+        // PA-6.A: dispatch by source-column dataType. PartitionStatistics.schema
+        // emits 5 fields per source column (lowerBound, upperBound, nullCount,
+        // count, sizeInBytes) where lowerBound/upperBound carry the SOURCE
+        // column dataType (see ~/spark/.../ColumnStats.scala line 25-32).
+        // schema==null => legacy BIGINT-only behavior (PA-3.2).
+        val dt: org.apache.spark.sql.types.DataType =
+          if (schema == null) org.apache.spark.sql.types.LongType else schema(base).dataType
+        dt match {
+          case org.apache.spark.sql.types.IntegerType =>
+            // writeU32LE writes 4 LE bytes; signed Int has identical bit pattern.
+            writeU32LE(baos, 4)
+            writeU32LE(baos, stats.getInt(base))
+            writeU32LE(baos, 4)
+            writeU32LE(baos, stats.getInt(base + 1))
+          case org.apache.spark.sql.types.LongType =>
+            writeU32LE(baos, 8)
+            writeI64LE(baos, stats.getLong(base))
+            writeU32LE(baos, 8)
+            writeI64LE(baos, stats.getLong(base + 1))
+          case other =>
+            throw new UnsupportedOperationException(
+              s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
+                "(landing in PA-6.B/C/F/G or PA-7..PA-10)")
+        }
       }
       col += 1
     }
@@ -329,16 +349,38 @@ object CachedColumnarBatchKryoSerializer {
       val count = buf.getInt
       val sizeInBytes = buf.getLong
       if (supported == 1) {
+        // PA-6.A: dispatch by source-column dataType. schema==null => legacy
+        // BIGINT-only (PA-3.2). lowerLen on the wire still authoritative for
+        // payload width; we cross-check against schema dispatch.
+        val dt: org.apache.spark.sql.types.DataType =
+          if (schema == null) org.apache.spark.sql.types.LongType else schema(base).dataType
         val lowerLen = buf.getInt
-        require(
-          lowerLen == 8,
-          s"PA-3.2 only supports BIGINT 8-byte lowerBound, got $lowerLen")
-        row.update(base, buf.getLong)
-        val upperLen = buf.getInt
-        require(
-          upperLen == 8,
-          s"PA-3.2 only supports BIGINT 8-byte upperBound, got $upperLen")
-        row.update(base + 1, buf.getLong)
+        dt match {
+          case org.apache.spark.sql.types.IntegerType =>
+            require(
+              lowerLen == 4,
+              s"PA-6.A IntegerType expects 4-byte lowerBound, got $lowerLen")
+            row.update(base, buf.getInt)
+            val upperLen = buf.getInt
+            require(
+              upperLen == 4,
+              s"PA-6.A IntegerType expects 4-byte upperBound, got $upperLen")
+            row.update(base + 1, buf.getInt)
+          case org.apache.spark.sql.types.LongType =>
+            require(
+              lowerLen == 8,
+              s"PA-3.2/LongType expects 8-byte lowerBound, got $lowerLen")
+            row.update(base, buf.getLong)
+            val upperLen = buf.getInt
+            require(
+              upperLen == 8,
+              s"PA-3.2/LongType expects 8-byte upperBound, got $upperLen")
+            row.update(base + 1, buf.getLong)
+          case other =>
+            throw new UnsupportedOperationException(
+              s"PA-6.A deserializeStats: dispatch for $other not implemented yet " +
+                "(landing in PA-6.B/C/F/G or PA-7..PA-10)")
+        }
       }
       row.update(base + 2, nullCount)
       row.update(base + 3, count)

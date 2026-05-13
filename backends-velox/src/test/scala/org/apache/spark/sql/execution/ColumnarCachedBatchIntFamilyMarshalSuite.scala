@@ -1,0 +1,63 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.spark.sql.execution
+
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
+import org.apache.spark.sql.types.{IntegerType, LongType, StructField, StructType}
+
+import org.scalatest.funsuite.AnyFunSuite
+
+/**
+ * PA-6 G1 integer-family marshal tests (JVM-only unit tests, no native build).
+ *
+ * The cpp side (PA-6.2) emits supported=0 for non-BIGINT integer columns until the typeKind
+ * dispatch lands. These tests pin the JVM serialize/deserialize dispatch by source-column dataType
+ * so that when cpp catches up, plumbing is already correct (and end-to-end prune in PA-6.D/E
+ * becomes a pure cpp delta).
+ *
+ * Refs: todos/features/gluten-inmemory-cache-stats/docs/0008-layerA-fulltype-extension.md
+ * todos/features/gluten-inmemory-cache-stats/docs/0004-layerA-implementation-plan.md PA-6
+ */
+class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
+
+  // PA-6.A RED expected: serializeStats currently hard-calls stats.getLong(base)
+  // for every column (BIGINT-only PA-3.2 path); supplying an Integer lo/hi will
+  // throw ClassCastException at unboxToLong even though we now pass the schema.
+  // GREEN: serializeStats branches on schema(col).dataType, writes 4-byte LE for
+  // IntegerType, and deserializeStats reads it back as Int.
+  test("PA-6.A INT round-trip 4B LE preserves value") {
+    val lo: Integer = Int.box(-2147483)
+    val hi: Integer = Int.box(2147483)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 100, 400L))
+    val schema = StructType(Seq(
+      StructField("k.lowerBound", IntegerType, nullable = true),
+      StructField("k.upperBound", IntegerType, nullable = true),
+      StructField("k.nullCount", IntegerType, nullable = false),
+      StructField("k.count", IntegerType, nullable = false),
+      StructField("k.sizeInBytes", LongType, nullable = false)
+    ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getInt(0) == lo, s"lower bound corrupted: expected $lo got ${read.getInt(0)}")
+    assert(read.getInt(1) == hi, s"upper bound corrupted: expected $hi got ${read.getInt(1)}")
+    assert(read.getInt(2) == 0, "nullCount roundtrip")
+    assert(read.getInt(3) == 100, "count roundtrip")
+    assert(read.getLong(4) == 400L, "sizeInBytes roundtrip")
+  }
+}
