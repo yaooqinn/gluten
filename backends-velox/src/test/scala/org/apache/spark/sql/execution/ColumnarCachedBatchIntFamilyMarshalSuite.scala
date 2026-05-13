@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.types.{ByteType, DayTimeIntervalType, IntegerType, LongType, ShortType, StructField, StructType, YearMonthIntervalType}
+import org.apache.spark.sql.types.{ByteType, DateType, DayTimeIntervalType, IntegerType, LongType, ShortType, StructField, StructType, TimestampNTZType, TimestampType, YearMonthIntervalType}
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -146,5 +146,68 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
     assert(read.getLong(0) == lo, s"lower: expected $lo got ${read.getLong(0)}")
     assert(read.getLong(1) == hi, s"upper: expected $hi got ${read.getLong(1)}")
+  }
+
+  // PA-6.G.1 RED expected: DateType not in dispatch.
+  // GREEN: DateType reuses IntegerType branch (4 LE bytes, days since epoch).
+  test("PA-6.G.1 Date round-trip 4B LE (days since epoch as Int)") {
+    val lo: Integer = Int.box(0) // 1970-01-01
+    val hi: Integer = Int.box(20000) // ~2024
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 100, 400L))
+    val schema = StructType(
+      Seq(
+        StructField("d.lowerBound", DateType, nullable = true),
+        StructField("d.upperBound", DateType, nullable = true),
+        StructField("d.nullCount", IntegerType, nullable = false),
+        StructField("d.count", IntegerType, nullable = false),
+        StructField("d.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getInt(0) == lo)
+    assert(read.getInt(1) == hi)
+  }
+
+  // PA-6.G.2 RED expected: TimestampType not in dispatch.
+  // GREEN: TimestampType reuses LongType branch (8 LE bytes, microseconds).
+  test("PA-6.G.2 Timestamp round-trip 8B LE (microseconds as Long)") {
+    val lo: java.lang.Long = Long.box(1700000000000000L)
+    val hi: java.lang.Long = Long.box(1800000000000000L)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 100, 800L))
+    val schema = StructType(
+      Seq(
+        StructField("ts.lowerBound", TimestampType, nullable = true),
+        StructField("ts.upperBound", TimestampType, nullable = true),
+        StructField("ts.nullCount", IntegerType, nullable = false),
+        StructField("ts.count", IntegerType, nullable = false),
+        StructField("ts.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getLong(0) == lo)
+    assert(read.getLong(1) == hi)
+  }
+
+  // PA-6.G.3 RED expected: TimestampNTZType not in dispatch.
+  // GREEN: TimestampNTZType reuses LongType branch (8 LE bytes, microseconds).
+  test("PA-6.G.3 TimestampNTZ round-trip 8B LE (microseconds as Long)") {
+    val lo: java.lang.Long = Long.box(0L)
+    val hi: java.lang.Long = Long.box(2000000000000000L)
+    val stats: InternalRow = new GenericInternalRow(
+      Array[Any](lo, hi, 0, 100, 800L))
+    val schema = StructType(
+      Seq(
+        StructField("tsntz.lowerBound", TimestampNTZType, nullable = true),
+        StructField("tsntz.upperBound", TimestampNTZType, nullable = true),
+        StructField("tsntz.nullCount", IntegerType, nullable = false),
+        StructField("tsntz.count", IntegerType, nullable = false),
+        StructField("tsntz.sizeInBytes", LongType, nullable = false)
+      ))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.getLong(0) == lo)
+    assert(read.getLong(1) == hi)
   }
 }

@@ -309,12 +309,13 @@ object CachedColumnarBatchKryoSerializer {
           if (schema == null) org.apache.spark.sql.types.LongType else schema(base).dataType
         dt match {
           case org.apache.spark.sql.types.IntegerType
+              | org.apache.spark.sql.types.DateType
               | _: org.apache.spark.sql.types.YearMonthIntervalType =>
-            // PA-6.A: 4 LE bytes signed Int. PA-6.F: YearMonthIntervalType
-            // physically Int (months), shares the path -- aligned with vanilla
-            // ColumnBuilder.scala line 187: `IntegerType | DateType |
-            // _: YearMonthIntervalType => IntColumnBuilder`. Date dispatch
-            // lands in PA-6.D once cpp emits stats for it.
+            // PA-6.A: 4 LE bytes signed Int.
+            // PA-6.G.1: DateType physically Int (days since epoch).
+            // PA-6.F.1: YearMonthIntervalType physically Int (months).
+            // Aligned with vanilla ColumnBuilder.scala line 187:
+            // `IntegerType | DateType | _: YearMonthIntervalType => IntColumnBuilder`.
             writeU32LE(baos, 4)
             writeU32LE(baos, stats.getInt(base))
             writeU32LE(baos, 4)
@@ -332,13 +333,15 @@ object CachedColumnarBatchKryoSerializer {
             writeU32LE(baos, 1)
             baos.write(stats.getByte(base + 1) & 0xff)
           case org.apache.spark.sql.types.LongType
+              | org.apache.spark.sql.types.TimestampType
+              | org.apache.spark.sql.types.TimestampNTZType
               | _: org.apache.spark.sql.types.DayTimeIntervalType =>
-            // PA-3.2: 8 LE bytes signed Long. PA-6.F: DayTimeIntervalType
-            // physically Long microseconds, shares the path -- aligned with
-            // vanilla ColumnBuilder.scala line 188: `LongType | TimestampType
-            // | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
-            // LongColumnBuilder`. TimestampType / TimestampNTZType / TimeType
-            // dispatch lands in PA-6.E/G once cpp emits stats.
+            // PA-3.2: 8 LE bytes signed Long.
+            // PA-6.G.2/3: TimestampType / TimestampNTZType physically Long microseconds.
+            // PA-6.F.2: DayTimeIntervalType physically Long microseconds.
+            // Aligned with vanilla ColumnBuilder.scala line 188.
+            // (TimeType deliberately omitted -- spark-4.1 may not expose it on
+            // this code path; revisit when PA-6.G.4 lands.)
             writeU32LE(baos, 8)
             writeI64LE(baos, stats.getLong(base))
             writeU32LE(baos, 8)
@@ -381,15 +384,16 @@ object CachedColumnarBatchKryoSerializer {
         val lowerLen = buf.getInt
         dt match {
           case org.apache.spark.sql.types.IntegerType
+              | org.apache.spark.sql.types.DateType
               | _: org.apache.spark.sql.types.YearMonthIntervalType =>
             require(
               lowerLen == 4,
-              s"PA-6.A/F.1 Integer-family expects 4-byte lowerBound, got $lowerLen")
+              s"PA-6.A/D/F.1 Integer-family expects 4-byte lowerBound, got $lowerLen")
             row.update(base, buf.getInt)
             val upperLen = buf.getInt
             require(
               upperLen == 4,
-              s"PA-6.A/F.1 Integer-family expects 4-byte upperBound, got $upperLen")
+              s"PA-6.A/D/F.1 Integer-family expects 4-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getInt)
           case org.apache.spark.sql.types.ShortType =>
             require(
@@ -412,15 +416,17 @@ object CachedColumnarBatchKryoSerializer {
               s"PA-6.C ByteType expects 1-byte upperBound, got $upperLen")
             row.update(base + 1, buf.get)
           case org.apache.spark.sql.types.LongType
+              | org.apache.spark.sql.types.TimestampType
+              | org.apache.spark.sql.types.TimestampNTZType
               | _: org.apache.spark.sql.types.DayTimeIntervalType =>
             require(
               lowerLen == 8,
-              s"PA-3.2/F.2 Long-family expects 8-byte lowerBound, got $lowerLen")
+              s"PA-3.2/E/G Long-family expects 8-byte lowerBound, got $lowerLen")
             row.update(base, buf.getLong)
             val upperLen = buf.getInt
             require(
               upperLen == 8,
-              s"PA-3.2/F.2 Long-family expects 8-byte upperBound, got $upperLen")
+              s"PA-3.2/E/G Long-family expects 8-byte upperBound, got $upperLen")
             row.update(base + 1, buf.getLong)
           case other =>
             throw new UnsupportedOperationException(
