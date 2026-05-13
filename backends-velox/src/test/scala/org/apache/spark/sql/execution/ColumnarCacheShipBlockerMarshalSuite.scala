@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.types.{Decimal, DecimalType, StructField, StructType}
+import org.apache.spark.sql.types.{Decimal, DecimalType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
 
 import org.scalatest.funsuite.AnyFunSuite
@@ -80,11 +80,12 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // PA-5.E ship blocker (NS3): String byte-wise lex prune. UTF8String must
-  // compare unsigned byte-by-byte; non-ASCII bytes (e.g. 0xE4 prefix for CJK)
-  // test that the marshal preserves byte values exactly.
-  // Trigger: when cpp marshals String min/max.
-  ignore("PA-5.E String byte-wise lex round-trip preserves UTF-8 bytes (follow-up PR acceptance)") {
+  // PA-9 (was PA-5.E ship blocker NS3): String byte-wise lex prune.
+  // UTF8String must compare unsigned byte-by-byte; non-ASCII bytes (e.g.
+  // 0xE4 prefix for CJK) test that the marshal preserves byte values exactly.
+  // Encoder truncates to 256B (design 0008 sec 3.1); short strings round-trip
+  // identically.
+  test("PA-9 String byte-wise lex round-trip preserves UTF-8 bytes") {
     val lo = UTF8String.fromString("apple")
     // UTF-8 bytes for two CJK code points (U+4E2D U+6587) constructed from hex
     // to keep this file ASCII-only (scalastyle nonascii filter).
@@ -97,11 +98,61 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
       0x87.toByte))
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](lo, hi, 0, 100, 1024L))
-    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, null)
-    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, null)
+    val schema = StructType(Seq(StructField("s", StringType)))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
     val readLo = read.getUTF8String(0)
     val readHi = read.getUTF8String(1)
     assert(readLo == lo, s"lower bound corrupted: expected $lo got $readLo")
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
+  }
+
+  // PA-9 truncate path: 300-byte upper triggers truncate to 256B + +1 carry.
+  // After truncate, decoded upper must compare byte-wise >= the original.
+  test("PA-9 String truncation to 256B widens upper bound monotonically") {
+    val loBytes = new Array[Byte](100)
+    java.util.Arrays.fill(loBytes, 'a'.toByte)
+    // Upper: 300 bytes of 'm' followed by trailing chars. Truncated prefix
+    // is 256 'm's (all 0x6d); +1 carry on last byte -> last byte = 0x6e.
+    val hiBytes = new Array[Byte](300)
+    java.util.Arrays.fill(hiBytes, 'm'.toByte)
+    val lo = UTF8String.fromBytes(loBytes)
+    val hi = UTF8String.fromBytes(hiBytes)
+    val stats: InternalRow = new GenericInternalRow(Array[Any](lo, hi, 0, 100, 50000L))
+    val schema = StructType(Seq(StructField("s", StringType)))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    val readLo = read.getUTF8String(0)
+    val readHi = read.getUTF8String(1)
+    assert(readLo.numBytes() == 100, s"lower untruncated, got numBytes=${readLo.numBytes()}")
+    assert(readHi.numBytes() == 256, s"upper should truncate to 256B, got ${readHi.numBytes()}")
+    val readHiArr = readHi.getBytes
+    // First 255 bytes still 'm', last byte 'm'+1 = 'n' (0x6e) due to carry.
+    var i = 0
+    while (i < 255) {
+      assert(readHiArr(i) == 'm'.toByte, s"upper byte $i = ${readHiArr(i)}, expected 'm'")
+      i += 1
+    }
+    assert(
+      readHiArr(255) == 'n'.toByte,
+      s"upper byte 255 should be 'n' (carry), got ${readHiArr(255)}")
+  }
+
+  // PA-9 carry-overflow demote: upper = 300 bytes of 0xFF cannot widen
+  // (carry overflows past byte 0), so encoder demotes supported=0.
+  // Reader returns null lower/upper bounds.
+  test("PA-9 String carry overflow demotes column to unsupported") {
+    val loBytes = new Array[Byte](10)
+    java.util.Arrays.fill(loBytes, 0xff.toByte)
+    val hiBytes = new Array[Byte](300)
+    java.util.Arrays.fill(hiBytes, 0xff.toByte)
+    val lo = UTF8String.fromBytes(loBytes)
+    val hi = UTF8String.fromBytes(hiBytes)
+    val stats: InternalRow = new GenericInternalRow(Array[Any](lo, hi, 0, 100, 50000L))
+    val schema = StructType(Seq(StructField("s", StringType)))
+    val blob = CachedColumnarBatchKryoSerializer.serializeStats(stats, schema)
+    val read = CachedColumnarBatchKryoSerializer.deserializeStats(blob, schema)
+    assert(read.isNullAt(0), "lower bound must be null when carry overflows")
+    assert(read.isNullAt(1), "upper bound must be null when carry overflows")
   }
 }

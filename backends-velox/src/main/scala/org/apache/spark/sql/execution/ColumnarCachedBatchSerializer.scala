@@ -334,6 +334,10 @@ object CachedColumnarBatchKryoSerializer {
       case org.apache.spark.sql.types.FloatType => true
       case org.apache.spark.sql.types.DoubleType => true
       case org.apache.spark.sql.types.BooleanType => true
+      // PA-9: variable-length UTF-8 bytes. Truncated to 256B on emit (design
+      // 0008 sec 3.1); reader is length-prefix driven so longer fallback widths
+      // (rare carry-overflow path) round-trip safely.
+      case org.apache.spark.sql.types.StringType => true
       case _ => false
     }
 
@@ -365,7 +369,20 @@ object CachedColumnarBatchKryoSerializer {
       // gate prevents UOE crash.
       val dispatchable = (schema == null) ||
         CachedColumnarBatchKryoSerializer.isDispatchable(schema(col).dataType)
-      val supported = hasLower && hasUpper && dispatchable
+      // PA-9: pre-compute String payload so an overflowing upper-bound carry
+      // can demote `supported` BEFORE the supported byte is written. Design
+      // 0008 sec 3.1: truncate to 256B, upper-bound +1 byte-wise carry; if carry
+      // overflows (all-0xFF prefix) the upper cannot widen, so we demote.
+      val isStringCol = (schema != null) && hasLower && hasUpper &&
+        (schema(col).dataType eq org.apache.spark.sql.types.StringType)
+      val stringPayload: Option[(Array[Byte], Array[Byte])] =
+        if (isStringCol) {
+          val loB = stats.getUTF8String(base).getBytes
+          val hiB = stats.getUTF8String(base + 1).getBytes
+          encodeStringBounds(loB, hiB)
+        } else None
+      val supported = hasLower && hasUpper && dispatchable &&
+        (!isStringCol || stringPayload.isDefined)
       baos.write(if (supported) 1 else 0)
       writeU32LE(baos, if (stats.isNullAt(base + 2)) 0 else stats.getInt(base + 2))
       writeU32LE(baos, if (stats.isNullAt(base + 3)) 0 else stats.getInt(base + 3))
@@ -453,6 +470,16 @@ object CachedColumnarBatchKryoSerializer {
             baos.write(if (stats.getBoolean(base)) 1 else 0)
             writeU32LE(baos, 1)
             baos.write(if (stats.getBoolean(base + 1)) 1 else 0)
+          case org.apache.spark.sql.types.StringType =>
+            // PA-9: variable-length UTF-8. lower = truncated 256B prefix
+            // (byte-wise <= original); upper = truncated 256B prefix with
+            // last byte +1 carry (byte-wise >= original). encodeStringBounds
+            // already validated carry didn't overflow (else demoted above).
+            val (lo, hi) = stringPayload.get
+            writeU32LE(baos, lo.length)
+            baos.write(lo)
+            writeU32LE(baos, hi.length)
+            baos.write(hi)
           case other =>
             throw new UnsupportedOperationException(
               s"PA-6.A serializeStats: dispatch for $other not implemented yet " +
@@ -594,6 +621,23 @@ object CachedColumnarBatchKryoSerializer {
             val upperLenB = buf.getInt
             require(upperLenB == 1, s"PA-10 BooleanType expects 1B upperBound, got $upperLenB")
             row.update(base + 1, buf.get != 0)
+          case org.apache.spark.sql.types.StringType =>
+            // PA-9: variable-length UTF-8 bytes. lowerLen on wire is
+            // authoritative (truncated to 256B by encoder, may be 0 only
+            // when supported=0 -- this branch already inside supported==1).
+            require(
+              lowerLen >= 0 && lowerLen <= 256,
+              s"PA-9 StringType expects lowerBound in [0, 256], got $lowerLen")
+            val loBytes = new Array[Byte](lowerLen)
+            buf.get(loBytes)
+            row.update(base, org.apache.spark.unsafe.types.UTF8String.fromBytes(loBytes))
+            val upperLenS = buf.getInt
+            require(
+              upperLenS >= 0 && upperLenS <= 256,
+              s"PA-9 StringType expects upperBound in [0, 256], got $upperLenS")
+            val hiBytes = new Array[Byte](upperLenS)
+            buf.get(hiBytes)
+            row.update(base + 1, org.apache.spark.unsafe.types.UTF8String.fromBytes(hiBytes))
           case other =>
             // PA-6.5 B2: cpp may emit supported=1 for short-Decimal (Velox
             // BIGINT physical) or other types not yet in JVM dispatch.
@@ -674,6 +718,42 @@ object CachedColumnarBatchKryoSerializer {
       i += 1
     }
     new java.math.BigInteger(be) // signed BE constructor
+  }
+
+  // PA-9: encode (lo, hi) string bounds for wire. Truncate each to 256 bytes
+  // byte-wise. Lower bound truncation is monotonic <= the original (prefix
+  // is byte-wise lex-le). Upper bound truncation requires +1 carry on the
+  // last byte to ensure the truncated upper >= original; if the carry
+  // propagates past byte 0 (i.e. all 256 prefix bytes were 0xFF), we cannot
+  // form a safe upper bound -> return None so the caller demotes supported.
+  // Returns the (loEnc, hiEnc) byte arrays sized in [0, 256].
+  private val PA9_STRING_TRUNCATE_LEN = 256
+  private def encodeStringBounds(
+      loBytes: Array[Byte],
+      hiBytes: Array[Byte]): Option[(Array[Byte], Array[Byte])] = {
+    val loLen = math.min(loBytes.length, PA9_STRING_TRUNCATE_LEN)
+    val loEnc = java.util.Arrays.copyOf(loBytes, loLen)
+    val hiSrcLen = math.min(hiBytes.length, PA9_STRING_TRUNCATE_LEN)
+    // If the original upper fit entirely, no carry needed; emit as-is.
+    if (hiBytes.length <= PA9_STRING_TRUNCATE_LEN) {
+      Some((loEnc, java.util.Arrays.copyOf(hiBytes, hiSrcLen)))
+    } else {
+      // Truncated; need +1 carry on the prefix to ensure encoded >= original.
+      val hiEnc = java.util.Arrays.copyOf(hiBytes, PA9_STRING_TRUNCATE_LEN)
+      var i = PA9_STRING_TRUNCATE_LEN - 1
+      while (i >= 0) {
+        val b = (hiEnc(i) & 0xff) + 1
+        if (b <= 0xff) {
+          hiEnc(i) = b.toByte
+          return Some((loEnc, hiEnc))
+        }
+        hiEnc(i) = 0.toByte
+        i -= 1
+      }
+      // Carry overflowed past byte 0 -- all 256 bytes were 0xFF. Cannot
+      // form a safe upper-bound widening, so demote to unsupported.
+      None
+    }
   }
 
   /**
