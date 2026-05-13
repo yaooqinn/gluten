@@ -196,4 +196,41 @@ class ColumnarCachedBatchE2ESuite
       df.unpersist()
     }
   }
+
+  // PA-6.2.D Date e2e prune correctness: with cpp INTEGER computeStats +
+  // 4B LE marshal landed in PA-6.2.B, a DateType column (days-since-epoch
+  // Int) must end-to-end prune the same way BIGINT does. Asserts:
+  //   (1) no crash
+  //   (2) result count correct
+  //   (3) numOutputRows << N (full-scan refuted)
+  // Refs: docs/0008-d-a5-full-type-alignment.md
+  test("PA-6.2.D Date column equality filter: prune via INTEGER stats (4B LE)") {
+    import org.apache.spark.sql.functions.{date_add, lit => sparkLit}
+    val base = sparkLit("2020-01-01").cast("date")
+    val cached = spark
+      .range(N)
+      .select(date_add(base, col("id").cast("int")).as("d"))
+      .repartitionByRange(P, col("d"))
+      .cache()
+    try {
+      cached.count() // materialize - triggers cpp INTEGER computeStats path
+      val pivotDate = date_add(base, sparkLit(pivot.toInt))
+      val df = cached.filter(col("d") === pivotDate)
+      val result = df.count()
+      assert(result == 1L, s"expected exactly one row matching date pivot, got $result")
+      val plan = df.queryExecution.executedPlan
+      val ims = find(plan) {
+        case _: InMemoryTableScanExec => true
+        case _ => false
+      }.get.asInstanceOf[InMemoryTableScanExec]
+      val outRows = ims.metrics("numOutputRows").value
+      val upperBound = (N / P) * 2
+      assert(
+        outRows <= upperBound,
+        s"numOutputRows=$outRows expected <= $upperBound (Date prune ineffective)"
+      )
+    } finally {
+      cached.unpersist()
+    }
+  }
 }
