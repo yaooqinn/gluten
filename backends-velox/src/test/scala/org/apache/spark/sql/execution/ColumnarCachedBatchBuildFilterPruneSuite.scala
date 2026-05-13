@@ -41,8 +41,6 @@ class ColumnarCachedBatchBuildFilterPruneSuite extends AnyFunSuite {
       stats = stats)
   }
 
-  // EqualTo literal IN range -> batch is kept.
-
   test("EqualTo literal in [lower, upper] keeps the batch") {
     val serializer = new ColumnarCachedBatchSerializer
     val attr = AttributeReference("id", LongType, nullable = false)()
@@ -56,7 +54,6 @@ class ColumnarCachedBatchBuildFilterPruneSuite extends AnyFunSuite {
     assert(result.head.numRows === 10)
   }
 
-  // EqualTo literal OUT of range -> batch is pruned.
   test("EqualTo literal outside [lower, upper] prunes the batch") {
     val serializer = new ColumnarCachedBatchSerializer
     val attr = AttributeReference("id", LongType, nullable = false)()
@@ -68,8 +65,6 @@ class ColumnarCachedBatchBuildFilterPruneSuite extends AnyFunSuite {
 
     assert(result.length === 0, "batch with [0, 100] cannot contain 999, must be pruned")
   }
-
-  // Mixed stream of stats=null + stats!=null batches.
 
   test("mixed null/non-null stats: null through, non-null pruned by predicate") {
     val serializer = new ColumnarCachedBatchSerializer

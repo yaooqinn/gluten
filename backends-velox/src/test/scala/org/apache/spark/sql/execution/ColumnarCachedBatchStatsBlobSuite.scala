@@ -31,8 +31,6 @@ import java.nio.{ByteBuffer, ByteOrder}
  */
 class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
 
-  // statsBlob produced by serializeStats matches the cpp-aligned
-
   test("statsBlob LE numCols + BIGINT cell round-trip byte-for-byte") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
@@ -63,8 +61,6 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
       "statsBlob must match cpp-aligned LE wire format byte-for-byte")
   }
 
-  // Round-trip serializeStats -> deserializeStats yields an
-
   test("serializeStats then deserializeStats round-trip BIGINT 1-col") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](-7L, 999L, 3, 100, 1024L))
@@ -79,8 +75,6 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
     assert(read.getLong(4) === 1024L, "sizeInBytes at slot 4")
   }
 
-  // Corrupt blob (numCols=huge) should fail eagerly with a clear
-
   test("corrupt statsBlob (numCols out of range) fails eagerly") {
     // Craft a blob claiming numCols=Int.MaxValue: 0xFF FF FF 7F
     val corruptNumCols = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
@@ -93,8 +87,6 @@ class ColumnarCachedBatchStatsBlobSuite extends AnyFunSuite {
       s"expected numCols range guard, got: ${ex.getMessage}")
   }
 
-  // Unsupported col (supported=0) round-trips with null
-  // lowerBound / upperBound and preserves nullCount / count / sizeInBytes.
   test("unsupported col round-trip preserves null bounds + metrics") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](null, null, 5, 50, 200L))

@@ -32,8 +32,6 @@ import java.util.Arrays
  */
 class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
 
-  // Decimal(10, 2) -- precision <= 18 uses Long backing
-
   test("Decimal(10, 2) round-trip preserves value") {
     val lo = Decimal(BigDecimal("1.50"), 10, 2)
     val hi = Decimal(BigDecimal("99.99"), 10, 2)
@@ -48,8 +46,6 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readLo == lo, s"lower bound corrupted: expected $lo got $readLo")
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
-
-  // Decimal(30, 5) -- precision > 18 uses BigInteger /
 
   test("Decimal(30, 5) round-trip preserves big value") {
     val big = BigDecimal("12345678901234567890.12345")
@@ -66,8 +62,6 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readLo == lo, s"lower bound corrupted: expected $lo got $readLo")
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
-
-  // String byte-wise lex prune.
 
   test("String byte-wise lex round-trip preserves UTF-8 bytes") {
     val lo = UTF8String.fromString("apple")
@@ -91,8 +85,6 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
     assert(readHi == hi, s"upper bound corrupted: expected $hi got $readHi")
   }
 
-  // Truncate path: 300-byte upper triggers truncate to 256B + +1 carry.
-  // After truncate, decoded upper must compare byte-wise >= the original.
   test("String truncation to 256B widens upper bound monotonically") {
     val loBytes = new Array[Byte](100)
     Arrays.fill(loBytes, 'a'.toByte)
@@ -121,8 +113,6 @@ class ColumnarCacheShipBlockerMarshalSuite extends AnyFunSuite {
       readHiArr(255) == 'n'.toByte,
       s"upper byte 255 should be 'n' (carry), got ${readHiArr(255)}")
   }
-
-  // Carry-overflow demote: upper = 300 bytes of 0xFF cannot widen
 
   test("String carry overflow demotes column to unsupported") {
     val loBytes = new Array[Byte](10)

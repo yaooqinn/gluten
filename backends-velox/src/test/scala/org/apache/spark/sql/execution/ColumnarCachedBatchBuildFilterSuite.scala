@@ -33,8 +33,6 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class ColumnarCachedBatchBuildFilterSuite extends AnyFunSuite {
 
-  // V1 binary (stats=null) + EqualTo predicate must NOT drop the batch.
-
   test("buildFilter must direct stats=null batches through under EqualTo predicate") {
     val serializer = new ColumnarCachedBatchSerializer
     val attr = AttributeReference("id", IntegerType, nullable = false)()

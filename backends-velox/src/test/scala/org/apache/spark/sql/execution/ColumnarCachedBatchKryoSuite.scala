@@ -56,8 +56,6 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     read
   }
 
-  // RED case 1: case class currently has 3 fields (numRows, sizeInBytes, bytes).
-
   test("V2 binary stats field round-trip") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
@@ -109,8 +107,6 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     read
   }
 
-  // RED case 2: backward compat -- v1 binary (without magic prefix) read by v2
-
   test("V1 binary backwards-compat read") {
     val payload = Array[Byte](9, 8, 7)
     val v1Binary = craftV1Binary(numRows = 7, sizeInBytes = 123L, payload = payload)
@@ -122,8 +118,6 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.bytes === payload)
     assert(read.stats === null, "v1 binary read must yield stats=null (graceful degrade)")
   }
-
-  // The 4-byte magic-prefix design choice (vs naive
 
   test("V1 magic-prefix guards against silent corruption") {
     // (a) Production reader: numRows=258 v1 binary should be read correctly.

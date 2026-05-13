@@ -51,8 +51,6 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     out.write((v >>> 24) & 0xff)
   }
 
-  // parseFramedBytes round-trips stats + bytesBlob.
-  // Expected RED failure: parseFramedBytes does not exist yet.
   test("parseFramedBytes round-trip BIGINT 1-col stats + bytesBlob") {
     val stats: InternalRow = new GenericInternalRow(
       Array[Any](42L, 100L, 0, 10, 64L))
@@ -72,8 +70,6 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
     assert(parsedStats.getLong(4) === 64L)
   }
 
-  // Corrupt magic must fail eagerly.
-  // Expected RED failure: parseFramedBytes does not exist yet (same as A).
   test("corrupt magic fails eagerly with clear message") {
     val payload = Array[Byte](1, 2, 3)
     val stats: InternalRow = new GenericInternalRow(
@@ -90,7 +86,6 @@ class ColumnarCachedBatchFramedBytesSuite extends AnyFunSuite {
       s"expected 'magic' in error, got: ${ex.getMessage}")
   }
 
-  // Truncated framing (declared statsLen exceeds remaining buffer).
   test("truncated framed bytes fails eagerly") {
     val payload = Array[Byte](1, 2, 3)
     val stats: InternalRow = new GenericInternalRow(

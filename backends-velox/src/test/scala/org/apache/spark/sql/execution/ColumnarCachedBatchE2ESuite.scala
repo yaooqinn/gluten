@@ -139,8 +139,6 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // All-null Long column. Partition that contains
-
   test("all-null Long column: cache + equality filter no crash + correct result") {
     val df = spark
       .range(N)
@@ -157,8 +155,6 @@ class ColumnarCachedBatchE2ESuite
       df.unpersist()
     }
   }
-
-  // Partition containing NaN Float must NOT have
 
   test("Float NaN partition: filter on non-NaN not silently pruned") {
     val df = spark
@@ -183,8 +179,6 @@ class ColumnarCachedBatchE2ESuite
       df.unpersist()
     }
   }
-
-  // Date e2e prune correctness: with cpp INTEGER computeStats +
 
   test("Date column equality filter: prune via INTEGER stats (4B LE)") {
     import org.apache.spark.sql.functions.{date_add, lit => sparkLit}
@@ -216,8 +210,6 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // Regression: multi-column cache must not crash with
-
   test("multi-column cache: no IndexOOB + correct result") {
     val cached = spark
       .range(N)
@@ -236,8 +228,6 @@ class ColumnarCachedBatchE2ESuite
     }
   }
 
-  // Regression: short-Decimal source column must not crash
-
   test("Decimal column cache: no UOE crash on materialize + read") {
     val cached = spark
       .range(N)
@@ -252,8 +242,6 @@ class ColumnarCachedBatchE2ESuite
       cached.unpersist()
     }
   }
-
-  // Regression: IsNotNull predicate must NOT silently skip a
 
   test("IsNotNull predicate honors vanilla count semantics") {
     val df = spark
@@ -272,8 +260,6 @@ class ColumnarCachedBatchE2ESuite
       df.unpersist()
     }
   }
-
-  // Timestamp e2e prune: TimestampType physically Long microseconds
 
   test("Timestamp column equality filter: prune via Long us stats (8B LE)") {
     import org.apache.spark.sql.functions.{lit => sparkLit}
@@ -306,8 +292,6 @@ class ColumnarCachedBatchE2ESuite
       cached.unpersist()
     }
   }
-
-  // String e2e prune sentinel. cpp scanMinMax<StringView> + variant
 
   test("String column equality filter: prune via byte-unsigned stats") {
     val cached = spark

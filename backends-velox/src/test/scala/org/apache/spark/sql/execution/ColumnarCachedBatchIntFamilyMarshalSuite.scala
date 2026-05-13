@@ -28,8 +28,6 @@ import org.scalatest.funsuite.AnyFunSuite
  */
 class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
 
-  // serializeStats hard-calls stats.getLong(base)
-
   test("INT round-trip 4B LE preserves value") {
     val lo: Integer = Int.box(-2147483)
     val hi: Integer = Int.box(2147483)
@@ -51,8 +49,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(4) == 400L, "sizeInBytes roundtrip")
   }
 
-  // Without dispatch: ShortType -> UnsupportedOperationException.
-  // GREEN: serializeStats + deserializeStats add ShortType branch writing 2 LE bytes.
   test("SMALLINT round-trip 2B LE preserves value (incl negative)") {
     val lo: java.lang.Short = Short.box((-12345).toShort)
     val hi: java.lang.Short = Short.box(12345.toShort)
@@ -72,8 +68,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(3) == 200, "count roundtrip")
   }
 
-  // Without dispatch: ByteType -> UnsupportedOperationException.
-  // GREEN: serializeStats + deserializeStats add ByteType branch writing 1 byte.
   test("TINYINT round-trip 1B preserves value (incl negative)") {
     val lo: java.lang.Byte = Byte.box((-128).toByte)
     val hi: java.lang.Byte = Byte.box(127.toByte)
@@ -94,8 +88,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(3) == 50, "count roundtrip")
   }
 
-  // YearMonthIntervalType not in dispatch.
-
   test("YearMonthInterval round-trip 4B LE (months as Int)") {
     val lo: Integer = Int.box(-12)
     val hi: Integer = Int.box(36)
@@ -114,8 +106,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(0) == lo, s"lower: expected $lo got ${read.getInt(0)}")
     assert(read.getInt(1) == hi, s"upper: expected $hi got ${read.getInt(1)}")
   }
-
-  // DayTimeIntervalType not in dispatch.
 
   test("DayTimeInterval round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(-86400000000L)
@@ -136,8 +126,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(1) == hi, s"upper: expected $hi got ${read.getLong(1)}")
   }
 
-  // Without dispatch: DateType -> UnsupportedOperationException.
-  // GREEN: DateType reuses IntegerType branch (4 LE bytes, days since epoch).
   test("Date round-trip 4B LE (days since epoch as Int)") {
     val lo: Integer = Int.box(0) // 1970-01-01
     val hi: Integer = Int.box(20000) // ~2024
@@ -157,8 +145,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getInt(1) == hi)
   }
 
-  // Without dispatch: TimestampType -> UnsupportedOperationException.
-  // GREEN: TimestampType reuses LongType branch (8 LE bytes, microseconds).
   test("Timestamp round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(1700000000000000L)
     val hi: java.lang.Long = Long.box(1800000000000000L)
@@ -178,8 +164,6 @@ class ColumnarCachedBatchIntFamilyMarshalSuite extends AnyFunSuite {
     assert(read.getLong(1) == hi)
   }
 
-  // Without dispatch: TimestampNTZType -> UnsupportedOperationException.
-  // GREEN: TimestampNTZType reuses LongType branch (8 LE bytes, microseconds).
   test("TimestampNTZ round-trip 8B LE (microseconds as Long)") {
     val lo: java.lang.Long = Long.box(0L)
     val hi: java.lang.Long = Long.box(2000000000000000L)
