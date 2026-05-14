@@ -109,12 +109,7 @@ namespace {
 // - +0 and -0: IEEE 754 declares them equal under <, ==; min/max bound is correct either way.
 // - subnormal (denormal) values: ordered like normal floats; no special handling needed.
 template <typename T>
-bool scanMinMax(
-    const facebook::velox::FlatVector<T>* flat,
-    T& tLo,
-    T& tHi,
-    int64_t& nullCnt,
-    bool& seen) {
+bool scanMinMax(const facebook::velox::FlatVector<T>* flat, T& tLo, T& tHi, int64_t& nullCnt, bool& seen) {
   const auto size = flat->size();
   const uint64_t* nulls = flat->rawNulls();
   const T* values = flat->rawValues();
@@ -134,8 +129,10 @@ bool scanMinMax(
       tHi = v;
       seen = true;
     } else {
-      if (v < tLo) tLo = v;
-      if (v > tHi) tHi = v;
+      if (v < tLo)
+        tLo = v;
+      if (v > tHi)
+        tHi = v;
     }
   }
   return true;
@@ -353,18 +350,12 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
   pushU32(numCols);
   for (const auto& s : perCol) {
     auto kind = s.lowerBound.kind();
-    bool emitSupported = s.hasLowerBound && s.hasUpperBound &&
-        s.lowerBound.kind() == s.upperBound.kind() &&
-        (kind == facebook::velox::TypeKind::BIGINT ||
-         kind == facebook::velox::TypeKind::INTEGER ||
-         kind == facebook::velox::TypeKind::SMALLINT ||
-         kind == facebook::velox::TypeKind::TINYINT ||
-         kind == facebook::velox::TypeKind::HUGEINT ||
-         kind == facebook::velox::TypeKind::REAL ||
-         kind == facebook::velox::TypeKind::DOUBLE ||
-         kind == facebook::velox::TypeKind::BOOLEAN ||
-         kind == facebook::velox::TypeKind::TIMESTAMP ||
-         kind == facebook::velox::TypeKind::VARCHAR);
+    bool emitSupported = s.hasLowerBound && s.hasUpperBound && s.lowerBound.kind() == s.upperBound.kind() &&
+        (kind == facebook::velox::TypeKind::BIGINT || kind == facebook::velox::TypeKind::INTEGER ||
+         kind == facebook::velox::TypeKind::SMALLINT || kind == facebook::velox::TypeKind::TINYINT ||
+         kind == facebook::velox::TypeKind::HUGEINT || kind == facebook::velox::TypeKind::REAL ||
+         kind == facebook::velox::TypeKind::DOUBLE || kind == facebook::velox::TypeKind::BOOLEAN ||
+         kind == facebook::velox::TypeKind::TIMESTAMP || kind == facebook::velox::TypeKind::VARCHAR);
     pushU8(emitSupported ? 1 : 0);
     pushU32(static_cast<uint32_t>(s.nullCount));
     // PartitionStatistics.count = numRows (vanilla gatherNullStats increments count for null

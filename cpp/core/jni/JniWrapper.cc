@@ -1297,7 +1297,8 @@ JNIEXPORT jobject JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSeriali
 // Framed [magic | statsLen | statsBlob | bytesLen | bytesBlob] entry point. Uses the
 // ColumnarBatchSerializer::framedSerializeWithStats virtual hook; non-Velox backends inherit
 // the default empty-vector return so callers fall back to the legacy serialize() path.
-JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_serializeWithStats( // NOLINT
+JNIEXPORT jbyteArray JNICALL
+Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_serializeWithStats( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jlong handle) {
@@ -1312,8 +1313,7 @@ JNIEXPORT jbyteArray JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSeri
 
   jbyteArray out = env->NewByteArray(static_cast<jsize>(framed.size()));
   if (!framed.empty()) {
-    env->SetByteArrayRegion(
-        out, 0, static_cast<jsize>(framed.size()), reinterpret_cast<jbyte*>(framed.data()));
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(framed.size()), reinterpret_cast<jbyte*>(framed.data()));
   }
   return out;
   JNI_METHOD_END(nullptr)
