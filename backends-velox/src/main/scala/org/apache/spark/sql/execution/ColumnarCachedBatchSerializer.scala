@@ -703,6 +703,11 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
              if heavy batch is encountered */
           batch => VeloxColumnarBatches.ensureVeloxBatch(batch)
         }
+        // Hoist the per-partition StructType out of the per-batch hot path: schema is constant
+        // for the lifetime of this iterator, so allocating one StructType per CachedBatch wastes
+        // GC for the many-small-batch case (Copilot review #5).
+        val structSchema = StructType(
+          schema.map(a => StructField(a.name, a.dataType, a.nullable)))
         new Iterator[CachedBatch] {
           override def hasNext: Boolean = veloxBatches.hasNext
 
@@ -725,12 +730,6 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
             if (partitionStatsEnabled && ColumnarCachedBatchSerializer.statsExtAvailable) {
               try {
                 val framed = jni.serializeWithStats(handle)
-                // Carry the per-batch StructType so the Kryo (spill / disk cache) read path can
-                // dispatch by dataType.
-                val structSchema = StructType(
-                  schema.map(
-                    a =>
-                      StructField(a.name, a.dataType, a.nullable)))
                 val (stats, bytesBlob) =
                   CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, structSchema)
                 CachedColumnarBatch(

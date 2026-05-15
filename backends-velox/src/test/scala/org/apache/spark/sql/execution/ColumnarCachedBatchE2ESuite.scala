@@ -320,4 +320,29 @@ class ColumnarCachedBatchE2ESuite
       cached.unpersist()
     }
   }
+
+  // Reviewer #4 (weiting-chen): config-gate negative test. With partitionStats.enabled=false
+  // (the production default), serializeWithStats must NOT be invoked -- the legacy serialize()
+  // path is taken and stats are emitted as null. A bug in the gate could silently activate
+  // stats for all users, or break correctness on the legacy path (e.g. NPE on null stats
+  // during read). This test exercises that disabled branch end-to-end so any regression
+  // surfaces as a crash or wrong result here.
+  //
+  // Note: we assert correctness only, not numOutputRows. The Gluten native scan reports row
+  // counts on a separate metrics path, so InMemoryTableScanExec.numOutputRows can legitimately
+  // be 0 in both gated branches (see "numOutputRows reflects post-filter row count" comment
+  // above). Correctness (result == 1L) plus the negative gating itself is what guards.
+  test("partitionStats.enabled=false: legacy serialize() path correctness preserved") {
+    withSQLConf(
+      GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED.key -> "false") {
+      val cached = cacheRange()
+      try {
+        cached.count() // materialize cache via legacy serialize() path (stats emitted as null)
+        val result = cached.filter(col("k") === pivot).count()
+        assert(result == 1L, s"expected exactly one row matching k=$pivot, got $result")
+      } finally {
+        cached.unpersist()
+      }
+    }
+  }
 }
