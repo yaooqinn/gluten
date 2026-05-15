@@ -26,6 +26,7 @@ import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.utils.ArrowAbiUtil
 import org.apache.gluten.vectorized.ColumnarBatchSerializerJniWrapper
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, GenericInternalRow}
@@ -671,24 +672,43 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
                 "ColumnarCachedBatchSerializer#serialize"))
             val handle =
               ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, batch)
-            // Route through serializeWithStats when the JNI extension is available AND the
-            // partition-stats conf is enabled. Capability is cached after first probe. When
-            // unavailable (older libgluten.so without the symbol, or conf left off) we fall back
-            // to the original serialize() path and emit stats=null; the buildFilter wrapper
-            // directs such batches through without pruning.
+            // Route through serializeWithStats when the partition-stats conf is enabled and the
+            // JNI extension is linked in libgluten.so. Capability is detected lazily at the
+            // call site: a new Gluten jar paired with an older native library will throw
+            // UnsatisfiedLinkError on the first invocation; we catch it once, cache the
+            // result, and fall back to the legacy serialize() path emitting stats=null. The
+            // buildFilter wrapper directs such batches through without pruning.
             val partitionStatsEnabled =
               GlutenConfig.get.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED)
-            if (partitionStatsEnabled && ColumnarBatchSerializerJniWrapper.supportsStatsExt()) {
-              val framed = jni.serializeWithStats(handle)
-              // Carry the per-batch StructType so the Kryo (spill / disk cache) read path can
-              // dispatch by dataType.
-              val structSchema = StructType(
-                schema.map(
-                  a =>
-                    StructField(a.name, a.dataType, a.nullable)))
-              val (stats, bytesBlob) =
-                CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, structSchema)
-              CachedColumnarBatch(batch.numRows(), bytesBlob.length, bytesBlob, stats, structSchema)
+            if (partitionStatsEnabled && ColumnarCachedBatchSerializer.statsExtAvailable) {
+              try {
+                val framed = jni.serializeWithStats(handle)
+                // Carry the per-batch StructType so the Kryo (spill / disk cache) read path can
+                // dispatch by dataType.
+                val structSchema = StructType(
+                  schema.map(
+                    a =>
+                      StructField(a.name, a.dataType, a.nullable)))
+                val (stats, bytesBlob) =
+                  CachedColumnarBatchKryoSerializer.parseFramedBytes(framed, structSchema)
+                CachedColumnarBatch(
+                  batch.numRows(),
+                  bytesBlob.length,
+                  bytesBlob,
+                  stats,
+                  structSchema)
+              } catch {
+                case e: UnsatisfiedLinkError =>
+                  ColumnarCachedBatchSerializer.markStatsExtUnavailable(e)
+                  val unsafeBuffer = jni.serialize(handle)
+                  val bytes = unsafeBuffer.toByteArray
+                  CachedColumnarBatch(
+                    batch.numRows(),
+                    bytes.length,
+                    bytes,
+                    stats = null,
+                    schema = null)
+              }
             } else {
               val unsafeBuffer = jni.serialize(handle)
               val bytes = unsafeBuffer.toByteArray
@@ -825,5 +845,33 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
           staged.next()
         }
       }
+  }
+}
+
+object ColumnarCachedBatchSerializer extends Logging {
+  // Lazy capability flag for the serializeWithStats JNI symbol. A new Gluten jar paired with an
+  // older libgluten.so will throw UnsatisfiedLinkError on the first invocation; the call site
+  // catches it once via markStatsExtUnavailable() and we degrade to the legacy serialize() path
+  // for the remainder of the JVM lifetime. Default true so the optimistic fast path is taken.
+  @volatile private var statsExtAvailableFlag: Boolean = true
+
+  def statsExtAvailable: Boolean = statsExtAvailableFlag
+
+  def markStatsExtUnavailable(cause: Throwable): Unit = {
+    if (statsExtAvailableFlag) {
+      statsExtAvailableFlag = false
+      logWarning(
+        "serializeWithStats JNI symbol is not linked in libgluten.so; " +
+          "falling back to serialize() and disabling per-partition stats for this JVM. " +
+          "This typically indicates a Gluten jar / native library version mismatch.",
+        cause
+      )
+    }
+  }
+
+  // Visible for testing: reset the capability flag so a unit test can re-exercise the
+  // probe-once semantics.
+  private[execution] def resetStatsExtAvailableForTesting(): Unit = {
+    statsExtAvailableFlag = true
   }
 }
