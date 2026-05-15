@@ -87,4 +87,94 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.bytes === Array[Byte](9, 8, 7))
     assert(read.stats === null)
   }
+
+  // === Slice 1.3: V1 wire backward-compat + bounds checks ===
+
+  // Build a V1-format byte stream: numRows + sizeInBytes + length + bytes, with NO trailing
+  // hasStats / hasSchema booleans. Mirrors a CachedColumnarBatch persisted by an older Gluten
+  // jar and surviving a rolling upgrade (DISK_ONLY / MEMORY_AND_DISK storage).
+  private def writeV1Stream(numRows: Int, sizeInBytes: Long, payload: Array[Byte]): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val out = new Output(baos)
+    out.writeInt(numRows)
+    out.writeLong(sizeInBytes)
+    out.writeInt(payload.length + 1)
+    out.writeBytes(payload)
+    out.close()
+    baos.toByteArray
+  }
+
+  test("V1 wire (no trailing hasStats/hasSchema booleans) reads as stats=null/schema=null") {
+    val raw = writeV1Stream(numRows = 5, sizeInBytes = 99L, payload = Array[Byte](1, 2, 3))
+    val ser = new CachedColumnarBatchKryoSerializer
+    val kryo = new Kryo()
+    val in = new Input(new ByteArrayInputStream(raw))
+    val read = ser.read(kryo, in, classOf[CachedColumnarBatch])
+    in.close()
+
+    assert(read.numRows === 5)
+    assert(read.sizeInBytes === 99L)
+    assert(read.bytes === Array[Byte](1, 2, 3))
+    assert(read.stats === null, "absent trailing hasStats must read as null, not throw")
+    assert(read.schema === null, "absent trailing hasSchema must read as null, not throw")
+  }
+
+  // Construct a corrupt stream by hand-writing the length-prefix only (no payload follows). The
+  // production read path must reject the bogus length BEFORE allocating the array, otherwise
+  // either negative-size or multi-GB allocation would crash the executor.
+  private def streamWithBogusLength(length: Int): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val out = new Output(baos)
+    out.writeInt(1) // numRows
+    out.writeLong(0L) // sizeInBytes
+    out.writeInt(length) // bogus length
+    out.close()
+    baos.toByteArray
+  }
+
+  test("read rejects negative length without NegativeArraySizeException") {
+    val raw = streamWithBogusLength(-100) // payloadLen = -101
+    val ser = new CachedColumnarBatchKryoSerializer
+    val in = new Input(new ByteArrayInputStream(raw))
+    val ex = intercept[IllegalArgumentException] {
+      ser.read(new Kryo(), in, classOf[CachedColumnarBatch])
+    }
+    assert(
+      ex.getMessage.contains("out of bounds"),
+      s"expected bounds-check failure, got: ${ex.getMessage}")
+  }
+
+  test("read rejects oversized length without OOM") {
+    // length = Int.MaxValue would attempt a 2 GB allocation (well above 64 MiB ceiling).
+    val raw = streamWithBogusLength(Int.MaxValue)
+    val ser = new CachedColumnarBatchKryoSerializer
+    val in = new Input(new ByteArrayInputStream(raw))
+    val ex = intercept[IllegalArgumentException] {
+      ser.read(new Kryo(), in, classOf[CachedColumnarBatch])
+    }
+    assert(
+      ex.getMessage.contains("out of bounds"),
+      s"expected bounds-check failure, got: ${ex.getMessage}")
+  }
+
+  test("read rejects oversized statsLen without OOM") {
+    // Build a stream with valid payload, hasStats=true, then a bogus statsLen.
+    val baos = new ByteArrayOutputStream()
+    val out = new Output(baos)
+    out.writeInt(1)
+    out.writeLong(0L)
+    out.writeInt(2) // payload length+1, payloadLen = 1
+    out.writeBytes(Array[Byte](7))
+    out.writeBoolean(true) // hasStats
+    out.writeInt(Int.MaxValue) // bogus statsLen
+    out.close()
+    val ser = new CachedColumnarBatchKryoSerializer
+    val in = new Input(new ByteArrayInputStream(baos.toByteArray))
+    val ex = intercept[IllegalArgumentException] {
+      ser.read(new Kryo(), in, classOf[CachedColumnarBatch])
+    }
+    assert(
+      ex.getMessage.contains("stats length"),
+      s"expected statsLen bounds-check failure, got: ${ex.getMessage}")
+  }
 }

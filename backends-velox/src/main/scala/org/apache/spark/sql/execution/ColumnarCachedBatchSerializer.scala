@@ -26,7 +26,9 @@ import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.utils.ArrowAbiUtil
 import org.apache.gluten.vectorized.ColumnarBatchSerializerJniWrapper
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.Kryo.KRYO_SERIALIZER_MAX_BUFFER_SIZE
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, GenericInternalRow}
@@ -127,6 +129,7 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       kryo: Kryo,
       input: Input,
       cls: Class[CachedColumnarBatch]): CachedColumnarBatch = {
+    val maxLen = CachedColumnarBatchKryoSerializer.maxKryoBufferBytes
     val numRows = input.readInt()
     val sizeInBytes = input.readLong()
     val length = input.readInt()
@@ -134,29 +137,54 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
       length != Kryo.NULL,
       "The object 'CachedColumnarBatch.bytes' is invalid or malformed to " +
         s"deserialize using ${this.getClass.getName}")
-    val bytes = new Array[Byte](length - 1)
+    // length is the byte payload size + 1 (the +1 distinguishes Kryo.NULL on the write side).
+    // Bound to spark.kryoserializer.buffer.max so a corrupt or malicious stream cannot trigger
+    // a multi-GB allocation; Spark's own Kryo write path enforces this same ceiling on the
+    // producing side, so any stream beyond it is already invalid.
+    val payloadLen = length - 1
+    require(
+      payloadLen >= 0 && payloadLen.toLong <= maxLen,
+      s"CachedColumnarBatch.bytes length ($payloadLen) out of bounds [0, $maxLen]; " +
+        "stream is corrupt or exceeds spark.kryoserializer.buffer.max"
+    )
+    val bytes = new Array[Byte](payloadLen)
     input.readBytes(bytes)
-    val hasStats = input.readBoolean()
+    // Backward-compat with the V1 wire format (no trailing hasStats / hasSchema booleans):
+    // legacy CachedColumnarBatch instances persisted on disk (DISK_ONLY / MEMORY_AND_DISK)
+    // surviving a rolling upgrade lack these fields. available() is best-effort -- treats
+    // unavailable suffix as "absent" instead of throwing KryoException.
+    val hasStats = input.available() > 0 && input.readBoolean()
     // Even when hasStats=false we still consume the hasSchema tag to keep the stream aligned.
     // NB: avoid `val (a: T, b: U) = ...` -- Scala 2.13 erases Tuple2 generics and the typed
     // pattern match throws MatchError at runtime.
     val statsAndSchema: (InternalRow, StructType) = if (hasStats) {
       val statsLen = input.readInt()
+      require(
+        statsLen >= 0 && statsLen.toLong <= maxLen,
+        s"CachedColumnarBatch stats length ($statsLen) out of bounds [0, $maxLen]; " +
+          "stream is corrupt or exceeds spark.kryoserializer.buffer.max"
+      )
       val statsBytes = new Array[Byte](statsLen)
       input.readBytes(statsBytes)
-      val sch = readOptionalSchema(input)
+      val sch = readOptionalSchema(input, maxLen)
       (CachedColumnarBatchKryoSerializer.deserializeStats(statsBytes, sch), sch)
     } else {
-      (null, readOptionalSchema(input))
+      (null, readOptionalSchema(input, maxLen))
     }
     CachedColumnarBatch(numRows, sizeInBytes, bytes, statsAndSchema._1, statsAndSchema._2)
   }
 
-  private def readOptionalSchema(input: Input): StructType = {
-    if (!input.readBoolean()) {
+  private def readOptionalSchema(input: Input, maxLen: Long): StructType = {
+    // Treat absent trailing bytes as "no schema": V1 wire format predates this field.
+    if (input.available() <= 0 || !input.readBoolean()) {
       null
     } else {
       val schemaLen = input.readInt()
+      require(
+        schemaLen >= 0 && schemaLen.toLong <= maxLen,
+        s"CachedColumnarBatch schema length ($schemaLen) out of bounds [0, $maxLen]; " +
+          "stream is corrupt or exceeds spark.kryoserializer.buffer.max"
+      )
       val schemaBytes = new Array[Byte](schemaLen)
       input.readBytes(schemaBytes)
       DataType.fromJson(new String(schemaBytes, UTF_8)).asInstanceOf[StructType]
@@ -165,6 +193,20 @@ class CachedColumnarBatchKryoSerializer extends KryoSerializer[CachedColumnarBat
 }
 
 object CachedColumnarBatchKryoSerializer {
+  // Defensive upper bound on any single length-prefixed field in the Kryo wire (payload bytes,
+  // statsBlob, schema JSON). Tied to spark.kryoserializer.buffer.max because Kryo write itself
+  // refuses to emit any single object larger than that ceiling, so any stream claiming a larger
+  // field is necessarily corrupt or malicious. Falls back to the conf default (64 MiB) when no
+  // SparkEnv is active (e.g. unit tests without a SparkContext).
+  def maxKryoBufferBytes: Long = {
+    val env = SparkEnv.get
+    if (env == null) {
+      KRYO_SERIALIZER_MAX_BUFFER_SIZE.defaultValue.get * 1024L * 1024L
+    } else {
+      env.conf.get(KRYO_SERIALIZER_MAX_BUFFER_SIZE) * 1024L * 1024L
+    }
+  }
+
   // Sanity-check magic for the cpp/JVM ABI of the framed JNI return (serializeWithStats). Not a
   // version tag: a corrupt or truncated cpp emit fails fast here instead of feeding garbage into
   // length-prefix readers downstream.
