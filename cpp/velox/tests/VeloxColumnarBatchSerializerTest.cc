@@ -658,4 +658,89 @@ TEST_F(VeloxColumnarBatchSerializerTest, varcharShortStringRoundTripsIntact) {
   EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 6), "banana");
 }
 
+// Batch 2 (PR #12092 zhli1142015 #7): BOOLEAN FlatVector min/max scan must use
+// valueAt(i)/isNullAt(i). FlatVector<bool>::rawValues() throws VeloxRuntimeError
+// (bit-packed storage). Without scanBoolMinMax, materializing a cached BooleanType
+// column would hard-fail. Verify nullable bool batch produces (lo=false, hi=true,
+// nullCount=2) instead of throwing.
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsBooleanFlatVectorWithNulls) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  std::vector<VectorPtr> children = {
+      makeNullableFlatVector<bool>({true, std::nullopt, false, std::nullopt, true}),
+  };
+  auto vector = makeRowVector(children);
+
+  std::vector<ColumnStats> stats;
+  ASSERT_NO_THROW(stats = serializer->computeStats(vector))
+      << "Boolean scan must NOT throw (Velox FlatVector<bool>::rawValues unsupported)";
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_TRUE(stats[0].hasLowerBound) << "Bool with non-null values must be supported";
+  EXPECT_TRUE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].lowerBound.value<bool>(), false);
+  EXPECT_EQ(stats[0].upperBound.value<bool>(), true);
+  EXPECT_EQ(stats[0].nullCount, 2);
+}
+
+// Batch 2 (PR #12092 zhli1142015 #8): NaN-poisoned float column must STILL accrue
+// real nullCount (not early-return). framed stats serialize nullCount even when
+// emitSupported=0; under-counting on `[NaN, null]` would let `col IS NULL` predicates
+// incorrectly prune matching rows under Spark IsNull pruning.
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsNaNFloatStillCountsNulls) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  std::vector<VectorPtr> children = {
+      // [1.0, null, NaN, null, 2.0] -- 2 nulls, 1 NaN poisons min/max.
+      makeNullableFlatVector<float>({1.0f, std::nullopt, nan, std::nullopt, 2.0f}),
+  };
+  auto vector = makeRowVector(children);
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_FALSE(stats[0].hasLowerBound) << "NaN poisons min/max -> unsupported";
+  EXPECT_FALSE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].nullCount, 2)
+      << "NaN scan must continue and count both nulls (NB4 rev6 — IsNull prune correctness)";
+}
+
+// Batch 2 (PR #12092 zhli1142015 #10): Non-flat encoding (Dictionary / Constant /
+// Complex) must still report a real nullCount. A null-bearing dict-encoded column
+// reporting nullCount=0 would be advertised as having no nulls and incorrectly
+// pruned by `col IS NULL`.
+TEST_F(VeloxColumnarBatchSerializerTest, computeStatsDictEncodedNullCountReported) {
+  auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
+  auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
+
+  // Base flat: [10, 20, 30]. Dictionary indices [0, 1, 0, 2, 1] but with nulls at
+  // positions 1 and 3 of the wrapping vector. Result has 5 rows, 2 nulls.
+  auto base = makeFlatVector<int32_t>({10, 20, 30});
+  vector_size_t outSize = 5;
+  BufferPtr indices = AlignedBuffer::allocate<vector_size_t>(outSize, pool_.get());
+  auto* rawIndices = indices->asMutable<vector_size_t>();
+  rawIndices[0] = 0;
+  rawIndices[1] = 1;
+  rawIndices[2] = 0;
+  rawIndices[3] = 2;
+  rawIndices[4] = 1;
+
+  BufferPtr nulls = AlignedBuffer::allocate<bool>(outSize, pool_.get());
+  auto* rawNulls = nulls->asMutable<uint64_t>();
+  bits::fillBits(rawNulls, 0, outSize, true);
+  bits::setNull(rawNulls, 1, true);
+  bits::setNull(rawNulls, 3, true);
+
+  auto dictVec = BaseVector::wrapInDictionary(nulls, indices, outSize, base);
+  std::vector<VectorPtr> children = {dictVec};
+  auto vector = makeRowVector(children);
+
+  auto stats = serializer->computeStats(vector);
+  ASSERT_EQ(stats.size(), 1u);
+  EXPECT_FALSE(stats[0].hasLowerBound) << "Dictionary encoding -> min/max unsupported";
+  EXPECT_FALSE(stats[0].hasUpperBound);
+  EXPECT_EQ(stats[0].nullCount, 2)
+      << "Dict-encoded vector with 2 nulls must report nullCount=2 (rev6 — IsNull prune correctness)";
+}
+
 } // namespace gluten

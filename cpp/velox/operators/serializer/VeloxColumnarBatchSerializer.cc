@@ -103,7 +103,10 @@ namespace {
 
 // Per-type FlatVector min/max scan + NaN guard. Returns false when the column must be marked
 // unsupported (any NaN observed for floating-point types -- Spark equality NaN != NaN means
-// min/max-based pruning would silently drop matching rows).
+// min/max-based pruning would silently drop matching rows). On NaN, scan still completes the
+// loop to accrue real nullCnt -- framed stats serialize nullCount even when emitSupported=0,
+// and Spark IsNull pruning reads `statsFor(a).nullCount > 0`; an under-counted nullCount on a
+// `[NaN, null]` partition would let `col IS NULL` predicates incorrectly prune matching rows.
 //
 // Floating-point edge cases that DO NOT poison the column:
 // - +/-Infinity: ordered (-Inf < x < +Inf for finite x); participate in min/max normally.
@@ -111,9 +114,11 @@ namespace {
 // - subnormal (denormal) values: ordered like normal floats; no special handling needed.
 template <typename T>
 bool scanMinMax(const facebook::velox::FlatVector<T>* flat, T& tLo, T& tHi, int64_t& nullCnt, bool& seen) {
+  static_assert(!std::is_same_v<T, bool>, "BOOLEAN must use scanBoolMinMax (FlatVector<bool>::rawValues unsupported)");
   const auto size = flat->size();
   const uint64_t* nulls = flat->rawNulls();
   const T* values = flat->rawValues();
+  bool floatingUnsupported = false;
   for (vector_size_t i = 0; i < size; ++i) {
     if (nulls != nullptr && bits::isBitNull(nulls, i)) {
       ++nullCnt;
@@ -122,9 +127,41 @@ bool scanMinMax(const facebook::velox::FlatVector<T>* flat, T& tLo, T& tHi, int6
     T v = values[i];
     if constexpr (std::is_floating_point_v<T>) {
       if (std::isnan(v)) {
-        return false;
+        floatingUnsupported = true;
+        // Continue scanning to accrue real nullCnt -- do NOT early-return.
+        continue;
       }
     }
+    if (floatingUnsupported) {
+      // NaN already poisoned min/max; skip bound updates but keep counting (nulls handled above).
+      continue;
+    }
+    if (!seen) {
+      tLo = v;
+      tHi = v;
+      seen = true;
+    } else {
+      if (v < tLo)
+        tLo = v;
+      if (v > tHi)
+        tHi = v;
+    }
+  }
+  return !floatingUnsupported;
+}
+
+// BOOLEAN-specific scan: FlatVector<bool>::rawValues() is unsupported in Velox (bit-packed
+// storage, no bool* accessor) and throws VeloxRuntimeError. Use valueAt(i)/isNullAt(i)
+// instead. Semantics match scanMinMax<T>: track lo/hi (false<true), accrue nullCnt.
+inline bool
+scanBoolMinMax(const facebook::velox::FlatVector<bool>* flat, bool& tLo, bool& tHi, int64_t& nullCnt, bool& seen) {
+  const auto size = flat->size();
+  for (vector_size_t i = 0; i < size; ++i) {
+    if (flat->isNullAt(i)) {
+      ++nullCnt;
+      continue;
+    }
+    bool v = flat->valueAt(i);
     if (!seen) {
       tLo = v;
       tHi = v;
@@ -139,6 +176,20 @@ bool scanMinMax(const facebook::velox::FlatVector<T>* flat, T& tLo, T& tHi, int6
   return true;
 }
 
+// Null counter for non-flat encoding (Dictionary / Constant / Complex). Their rawValues path
+// is undefined for stats compute; we still must report a real nullCount so JVM-side IsNull
+// pruning (`statsFor(a).nullCount > 0`) does not incorrectly skip null-bearing partitions.
+inline int64_t countNullsAny(const facebook::velox::BaseVector* vec) {
+  const auto size = vec->size();
+  int64_t nullCnt = 0;
+  for (vector_size_t i = 0; i < size; ++i) {
+    if (vec->isNullAt(i)) {
+      ++nullCnt;
+    }
+  }
+  return nullCnt;
+}
+
 } // namespace
 
 std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr rowVector) {
@@ -148,7 +199,14 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
   for (column_index_t col = 0; col < numCols; ++col) {
     auto& stats = result[col];
     auto child = rowVector->childAt(col);
-    if (child == nullptr || !child->isFlatEncoding()) {
+    if (child == nullptr) {
+      continue;
+    }
+    if (!child->isFlatEncoding()) {
+      // Non-flat (Dictionary / Constant / Complex): min/max stays unsupported, but we MUST
+      // still report a real nullCount. Spark IsNull pruning reads `statsFor(a).nullCount > 0`
+      // and a default-0 on a null-bearing dict-encoded column would incorrectly prune.
+      stats.nullCount = countNullsAny(child.get());
       continue;
     }
     bool seen = false;
@@ -230,7 +288,7 @@ std::vector<ColumnStats> VeloxColumnarBatchSerializer::computeStats(RowVectorPtr
       case TypeKind::BOOLEAN: {
         auto* flat = child->asFlatVector<bool>();
         bool lo = false, hi = false;
-        supported = scanMinMax<bool>(flat, lo, hi, nullCnt, seen);
+        supported = scanBoolMinMax(flat, lo, hi, nullCnt, seen);
         if (supported && seen) {
           stats.hasLowerBound = true;
           stats.hasUpperBound = true;
