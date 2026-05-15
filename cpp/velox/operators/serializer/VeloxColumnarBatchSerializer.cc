@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "memory/ArrowMemory.h"
 #include "memory/VeloxColumnarBatch.h"
@@ -490,6 +491,12 @@ std::vector<uint8_t> VeloxColumnarBatchSerializer::framedSerializeWithStats(
   framed.push_back(static_cast<uint8_t>((statsLen >> 16) & 0xFF));
   framed.push_back(static_cast<uint8_t>((statsLen >> 24) & 0xFF));
   framed.insert(framed.end(), statsBlob.begin(), statsBlob.end());
+  // Wire framing encodes bytesLen as u32 LE, so reject any single-batch payload that would
+  // overflow that field (>4GB). Pathological in practice (very wide schemas / huge string
+  // columns); fail fast here rather than silently truncate and corrupt the JVM-side parser.
+  GLUTEN_CHECK(
+      bytesLen >= 0 && bytesLen <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+      "Serialized batch size (" + std::to_string(bytesLen) + ") exceeds u32 framing limit");
   const uint32_t bytesLen32 = static_cast<uint32_t>(bytesLen);
   framed.push_back(static_cast<uint8_t>(bytesLen32 & 0xFF));
   framed.push_back(static_cast<uint8_t>((bytesLen32 >> 8) & 0xFF));
