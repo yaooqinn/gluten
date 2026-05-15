@@ -658,11 +658,11 @@ TEST_F(VeloxColumnarBatchSerializerTest, varcharShortStringRoundTripsIntact) {
   EXPECT_EQ(std::string(reinterpret_cast<const char*>(p), 6), "banana");
 }
 
-// Batch 2 (PR #12092 zhli1142015 #7): BOOLEAN FlatVector min/max scan must use
-// valueAt(i)/isNullAt(i). FlatVector<bool>::rawValues() throws VeloxRuntimeError
-// (bit-packed storage). Without scanBoolMinMax, materializing a cached BooleanType
-// column would hard-fail. Verify nullable bool batch produces (lo=false, hi=true,
-// nullCount=2) instead of throwing.
+// BOOLEAN FlatVector min/max scan must use valueAt(i)/isNullAt(i):
+// FlatVector<bool>::rawValues() throws VeloxRuntimeError (bit-packed
+// storage), so without scanBoolMinMax materializing a cached
+// BooleanType column would hard-fail. Verify nullable bool batch
+// produces (lo=false, hi=true, nullCount=2) instead of throwing.
 TEST_F(VeloxColumnarBatchSerializerTest, computeStatsBooleanFlatVectorWithNulls) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
@@ -683,10 +683,11 @@ TEST_F(VeloxColumnarBatchSerializerTest, computeStatsBooleanFlatVectorWithNulls)
   EXPECT_EQ(stats[0].nullCount, 2);
 }
 
-// Batch 2 (PR #12092 zhli1142015 #8): NaN-poisoned float column must STILL accrue
-// real nullCount (not early-return). framed stats serialize nullCount even when
-// emitSupported=0; under-counting on `[NaN, null]` would let `col IS NULL` predicates
-// incorrectly prune matching rows under Spark IsNull pruning.
+// NaN-poisoned float column must STILL accrue real nullCount (not
+// early-return). framed stats serialize nullCount even when
+// emitSupported=0; under-counting on `[NaN, null]` would let
+// `col IS NULL` predicates incorrectly prune matching rows under
+// Spark IsNull pruning.
 TEST_F(VeloxColumnarBatchSerializerTest, computeStatsNaNFloatStillCountsNulls) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
@@ -701,14 +702,13 @@ TEST_F(VeloxColumnarBatchSerializerTest, computeStatsNaNFloatStillCountsNulls) {
   ASSERT_EQ(stats.size(), 1u);
   EXPECT_FALSE(stats[0].hasLowerBound) << "NaN poisons min/max -> unsupported";
   EXPECT_FALSE(stats[0].hasUpperBound);
-  EXPECT_EQ(stats[0].nullCount, 2)
-      << "NaN scan must continue and count both nulls (NB4 rev6 — IsNull prune correctness)";
+  EXPECT_EQ(stats[0].nullCount, 2) << "NaN scan must continue and count both nulls (IsNull prune correctness)";
 }
 
-// Batch 2 (PR #12092 zhli1142015 #10): Non-flat encoding (Dictionary / Constant /
-// Complex) must still report a real nullCount. A null-bearing dict-encoded column
-// reporting nullCount=0 would be advertised as having no nulls and incorrectly
-// pruned by `col IS NULL`.
+// Non-flat encoding (Dictionary / Constant / Complex) must still
+// report a real nullCount. A null-bearing dict-encoded column
+// reporting nullCount=0 would be advertised as having no nulls and
+// incorrectly pruned by `col IS NULL`.
 TEST_F(VeloxColumnarBatchSerializerTest, computeStatsDictEncodedNullCountReported) {
   auto* arrowPool = getDefaultMemoryManager()->defaultArrowMemoryPool();
   auto serializer = std::make_shared<VeloxColumnarBatchSerializer>(arrowPool, pool_, nullptr);
@@ -740,7 +740,7 @@ TEST_F(VeloxColumnarBatchSerializerTest, computeStatsDictEncodedNullCountReporte
   EXPECT_FALSE(stats[0].hasLowerBound) << "Dictionary encoding -> min/max unsupported";
   EXPECT_FALSE(stats[0].hasUpperBound);
   EXPECT_EQ(stats[0].nullCount, 2)
-      << "Dict-encoded vector with 2 nulls must report nullCount=2 (rev6 — IsNull prune correctness)";
+      << "Dict-encoded vector with 2 nulls must report nullCount=2 (IsNull prune correctness)";
 }
 
 } // namespace gluten

@@ -705,7 +705,7 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer {
         }
         // Hoist the per-partition StructType out of the per-batch hot path: schema is constant
         // for the lifetime of this iterator, so allocating one StructType per CachedBatch wastes
-        // GC for the many-small-batch case (Copilot review #5).
+        // GC for the many-small-batch case.
         val structSchema = StructType(
           schema.map(a => StructField(a.name, a.dataType, a.nullable)))
         new Iterator[CachedBatch] {

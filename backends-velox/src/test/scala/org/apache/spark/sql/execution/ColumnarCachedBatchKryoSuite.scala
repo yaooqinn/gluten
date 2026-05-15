@@ -88,8 +88,6 @@ class ColumnarCachedBatchKryoSuite extends AnyFunSuite {
     assert(read.stats === null)
   }
 
-  // === Slice 1.3: V1 wire backward-compat + bounds checks ===
-
   // Build a V1-format byte stream: numRows + sizeInBytes + length + bytes, with NO trailing
   // hasStats / hasSchema booleans. Mirrors a CachedColumnarBatch persisted by an older Gluten
   // jar and surviving a rolling upgrade (DISK_ONLY / MEMORY_AND_DISK storage).
