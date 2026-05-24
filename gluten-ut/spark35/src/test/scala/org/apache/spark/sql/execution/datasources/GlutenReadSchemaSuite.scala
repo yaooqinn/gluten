@@ -21,13 +21,11 @@ import org.apache.spark.sql.internal.SQLConf
 
 import java.io.File
 
-class GlutenCSVReadSchemaSuite extends CSVReadSchemaSuite with GlutenSQLTestsBaseTrait {
+class GlutenCSVReadSchemaSuite extends CSVReadSchemaSuite with GlutenSQLTestsBaseTrait {}
 
-}
-
-class GlutenHeaderCSVReadSchemaSuite extends HeaderCSVReadSchemaSuite with GlutenSQLTestsBaseTrait {
-
-}
+class GlutenHeaderCSVReadSchemaSuite
+  extends HeaderCSVReadSchemaSuite
+  with GlutenSQLTestsBaseTrait {}
 
 class GlutenJsonReadSchemaSuite extends JsonReadSchemaSuite with GlutenSQLTestsBaseTrait {}
 
