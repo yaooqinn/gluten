@@ -645,12 +645,46 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
     }
   }
 
+  /**
+   * Schema-shape gate added on top of [[validateSchema]] to avoid the R2C + Arrow materialization
+   * tax that dominates on wide-string / wide-row workloads (see issue #3456). Returns false when
+   * the relation's schema is dominated by variable-length payload, in which case the relation falls
+   * back to Spark's [[DefaultCachedBatchSerializer]]. Both gates are session-overridable via
+   * `spark.gluten.sql.columnar.tableCache.maxStringFraction` and
+   * `spark.gluten.sql.columnar.tableCache.maxAvgRowBytes`.
+   */
+  private def schemaHeuristic(schema: Seq[Attribute]): Boolean = {
+    schemaHeuristic(toStructType(schema))
+  }
+
+  private def schemaHeuristic(schema: StructType): Boolean = {
+    val conf = glutenConf
+    val maxStringFraction =
+      conf.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_STRING_FRACTION)
+    val maxAvgRowBytes =
+      conf.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_AVG_ROW_BYTES)
+    val total = math.max(schema.fields.length, 1)
+    val stringLike = schema.fields.count {
+      f => f.dataType.isInstanceOf[StringType] || f.dataType.isInstanceOf[BinaryType]
+    }
+    val stringFraction = stringLike.toDouble / total
+    val avgRowBytes = schema.fields.map(_.dataType.defaultSize.toLong).sum
+    val ok = stringFraction <= maxStringFraction && avgRowBytes <= maxAvgRowBytes
+    if (!ok) {
+      logInfo(
+        s"Columnar cache falls back to row-based serializer for schema-shape " +
+          s"reasons: stringFraction=$stringFraction (max=$maxStringFraction), " +
+          s"avgRowBytes=$avgRowBytes (max=$maxAvgRowBytes)")
+    }
+    ok
+  }
+
   override def supportsColumnarInput(schema: Seq[Attribute]): Boolean = {
-    glutenConf.enableGluten && validateSchema(schema)
+    glutenConf.enableGluten && validateSchema(schema) && schemaHeuristic(schema)
   }
 
   override def supportsColumnarOutput(schema: StructType): Boolean = {
-    glutenConf.enableGluten && validateSchema(schema)
+    glutenConf.enableGluten && validateSchema(schema) && schemaHeuristic(schema)
   }
 
   override def convertInternalRowToCachedBatch(
@@ -659,8 +693,10 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       storageLevel: StorageLevel,
       conf: SQLConf): RDD[CachedBatch] = {
     val localSchema = toStructType(schema)
-    if (!validateSchema(localSchema)) {
-      // we cannot use columnar cache here, as the `RowToColumnar` does not support this schema
+    if (!validateSchema(localSchema) || !schemaHeuristic(schema)) {
+      // Either the schema has Velox-unsupported types, or schema-shape heuristics
+      // (string fraction / avg row bytes) predict that columnar cache would lose
+      // to the row-based path. See #3456 for the wide-string regression case.
       rowBasedCachedBatchSerializer.convertInternalRowToCachedBatch(
         input,
         schema,
@@ -685,9 +721,11 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       cacheAttributes: Seq[Attribute],
       selectedAttributes: Seq[Attribute],
       conf: SQLConf): RDD[InternalRow] = {
-    if (!validateSchema(cacheAttributes)) {
-      // if we do not support this schema, that means we are using row-based serializer,
-      // see `convertInternalRowToCachedBatch`, so fallback to vanilla Spark serializer
+    if (!validateSchema(cacheAttributes) || !schemaHeuristic(cacheAttributes)) {
+      // The write side falls back to the row-based serializer when either the
+      // schema is unsupported or the schema-shape heuristic rejects it; the read
+      // side must apply the same predicate so it dispatches to the matching
+      // deserializer. See `convertInternalRowToCachedBatch` and #3456.
       rowBasedCachedBatchSerializer.convertCachedBatchToInternalRow(
         input,
         cacheAttributes,
@@ -779,9 +817,9 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       cacheAttributes: Seq[Attribute],
       selectedAttributes: Seq[Attribute],
       conf: SQLConf): RDD[ColumnarBatch] = {
-    if (!validateSchema(cacheAttributes)) {
-      // if we do not support this schema, that means we are using row-based serializer,
-      // see `convertInternalRowToCachedBatch`, so fallback to vanilla Spark serializer
+    if (!validateSchema(cacheAttributes) || !schemaHeuristic(cacheAttributes)) {
+      // See `convertCachedBatchToInternalRow` for why both gates must match the
+      // write side.
       rowBasedCachedBatchSerializer.convertCachedBatchToColumnarBatch(
         input,
         cacheAttributes,
