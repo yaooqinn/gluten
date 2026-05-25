@@ -91,8 +91,7 @@ class ColumnarCachedBatchSchemaHeuristicSuite
 
   test("session override re-enables columnar cache for wide-string schema") {
     withConf(
-      GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_STRING_FRACTION.key -> "1.0",
-      GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_AVG_ROW_BYTES.key -> Long.MaxValue.toString
+      GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_STRING_FRACTION.key -> "1.0"
     ) {
       val ser = new ColumnarCachedBatchSerializer
       val schema = StructType(
@@ -111,20 +110,6 @@ class ColumnarCachedBatchSchemaHeuristicSuite
     assert(
       ser.supportsColumnarInput(attrs(schema)),
       "stringFraction exactly at 0.5 must pass (inclusive boundary)")
-  }
-
-  test("avg-row-bytes gate alone rejects a wide numeric schema") {
-    withConf(
-      GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_AVG_ROW_BYTES.key -> "32"
-    ) {
-      val ser = new ColumnarCachedBatchSerializer
-      // 16 longs * 8 bytes = 128 bytes > 32-byte threshold
-      val schema = StructType(
-        (0 until 16).map(i => StructField(s"c$i", LongType, nullable = false)))
-      assert(
-        !ser.supportsColumnarInput(attrs(schema)),
-        "schema wider than maxAvgRowBytes must fall back")
-    }
   }
 
   test("e2e: wide-string DataFrame caches + reads correctly under fallback") {

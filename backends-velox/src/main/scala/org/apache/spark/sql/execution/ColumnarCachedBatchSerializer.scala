@@ -647,34 +647,28 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
 
   /**
    * Schema-shape gate added on top of [[validateSchema]] to avoid the R2C + Arrow materialization
-   * tax that dominates on wide-string / wide-row workloads (see issue #3456). Returns false when
-   * the relation's schema is dominated by variable-length payload, in which case the relation falls
-   * back to Spark's [[DefaultCachedBatchSerializer]]. Both gates are session-overridable via
-   * `spark.gluten.sql.columnar.tableCache.maxStringFraction` and
-   * `spark.gluten.sql.columnar.tableCache.maxAvgRowBytes`.
+   * tax that dominates on wide-string workloads (see issue #3456). Returns false when the
+   * relation's schema is dominated by string / binary columns, in which case the relation falls
+   * back to Spark's [[DefaultCachedBatchSerializer]]. Session-overridable via
+   * `spark.gluten.sql.columnar.tableCache.maxStringFraction`.
    */
   private def schemaHeuristic(schema: Seq[Attribute]): Boolean = {
     schemaHeuristic(toStructType(schema))
   }
 
   private def schemaHeuristic(schema: StructType): Boolean = {
-    val conf = glutenConf
     val maxStringFraction =
-      conf.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_STRING_FRACTION)
-    val maxAvgRowBytes =
-      conf.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_AVG_ROW_BYTES)
+      glutenConf.getConf(GlutenConfig.COLUMNAR_TABLE_CACHE_MAX_STRING_FRACTION)
     val total = math.max(schema.fields.length, 1)
     val stringLike = schema.fields.count {
       f => f.dataType.isInstanceOf[StringType] || f.dataType.isInstanceOf[BinaryType]
     }
     val stringFraction = stringLike.toDouble / total
-    val avgRowBytes = schema.fields.map(_.dataType.defaultSize.toLong).sum
-    val ok = stringFraction <= maxStringFraction && avgRowBytes <= maxAvgRowBytes
+    val ok = stringFraction <= maxStringFraction
     if (!ok) {
       logInfo(
-        s"Columnar cache falls back to row-based serializer for schema-shape " +
-          s"reasons: stringFraction=$stringFraction (max=$maxStringFraction), " +
-          s"avgRowBytes=$avgRowBytes (max=$maxAvgRowBytes)")
+        s"Columnar cache falls back to row-based serializer because " +
+          s"stringFraction=$stringFraction exceeds max=$maxStringFraction (see #3456)")
     }
     ok
   }
@@ -694,9 +688,9 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       conf: SQLConf): RDD[CachedBatch] = {
     val localSchema = toStructType(schema)
     if (!validateSchema(localSchema) || !schemaHeuristic(schema)) {
-      // Either the schema has Velox-unsupported types, or schema-shape heuristics
-      // (string fraction / avg row bytes) predict that columnar cache would lose
-      // to the row-based path. See #3456 for the wide-string regression case.
+      // Either the schema has Velox-unsupported types, or the string-fraction
+      // heuristic predicts that columnar cache would lose to the row-based path.
+      // See #3456 for the wide-string regression case.
       rowBasedCachedBatchSerializer.convertInternalRowToCachedBatch(
         input,
         schema,

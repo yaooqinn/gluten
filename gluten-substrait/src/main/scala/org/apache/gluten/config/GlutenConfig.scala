@@ -1040,18 +1040,6 @@ object GlutenConfig extends ConfigRegistry {
       .checkValue(v => v >= 0.0d && v <= 1.0d, "must be in [0.0, 1.0]")
       .createWithDefault(0.5d)
 
-  val COLUMNAR_TABLE_CACHE_MAX_AVG_ROW_BYTES =
-    buildConf("spark.gluten.sql.columnar.tableCache.maxAvgRowBytes")
-      .doc(
-        "Upper bound (in bytes) on the estimated average row size for which the " +
-          "Velox columnar cache serializer is used. Computed as the sum of " +
-          "`dataType.defaultSize` over the schema. Schemas wider than this fall " +
-          "back to Spark's DefaultCachedBatchSerializer. Set to Long.MaxValue " +
-          "to disable the gate.")
-      .longConf
-      .checkValue(_ > 0L, "must be positive")
-      .createWithDefault(1024L)
-
   val COLUMNAR_TABLE_CACHE_PARTITION_STATS_ENABLED =
     buildConf("spark.gluten.sql.columnar.tableCache.partitionStats.enabled")
       .doc(
