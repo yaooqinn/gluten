@@ -673,12 +673,25 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
     ok
   }
 
+  /**
+   * Combined gate over [[validateSchema]] (correctness: Velox-supported types) and
+   * [[schemaHeuristic]] (performance: avoid wide-string R2C tax, see #3456). Both must hold for the
+   * relation to take the columnar cache path. Kept separate internally so logs can distinguish
+   * "unsupported type" from "heuristic reject", but every external entry point goes through this
+   * helper to guarantee read/write consistency.
+   */
+  private def supportsSchema(schema: Seq[Attribute]): Boolean =
+    validateSchema(schema) && schemaHeuristic(schema)
+
+  private def supportsSchema(schema: StructType): Boolean =
+    validateSchema(schema) && schemaHeuristic(schema)
+
   override def supportsColumnarInput(schema: Seq[Attribute]): Boolean = {
-    glutenConf.enableGluten && validateSchema(schema) && schemaHeuristic(schema)
+    glutenConf.enableGluten && supportsSchema(schema)
   }
 
   override def supportsColumnarOutput(schema: StructType): Boolean = {
-    glutenConf.enableGluten && validateSchema(schema) && schemaHeuristic(schema)
+    glutenConf.enableGluten && supportsSchema(schema)
   }
 
   override def convertInternalRowToCachedBatch(
@@ -687,7 +700,7 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       storageLevel: StorageLevel,
       conf: SQLConf): RDD[CachedBatch] = {
     val localSchema = toStructType(schema)
-    if (!validateSchema(localSchema) || !schemaHeuristic(schema)) {
+    if (!supportsSchema(localSchema)) {
       // Either the schema has Velox-unsupported types, or the string-fraction
       // heuristic predicts that columnar cache would lose to the row-based path.
       // See #3456 for the wide-string regression case.
@@ -715,11 +728,11 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       cacheAttributes: Seq[Attribute],
       selectedAttributes: Seq[Attribute],
       conf: SQLConf): RDD[InternalRow] = {
-    if (!validateSchema(cacheAttributes) || !schemaHeuristic(cacheAttributes)) {
-      // The write side falls back to the row-based serializer when either the
-      // schema is unsupported or the schema-shape heuristic rejects it; the read
-      // side must apply the same predicate so it dispatches to the matching
-      // deserializer. See `convertInternalRowToCachedBatch` and #3456.
+    if (!supportsSchema(cacheAttributes)) {
+      // The write side falls back to the row-based serializer when either gate
+      // rejects the schema; the read side must apply the same predicate so it
+      // dispatches to the matching deserializer. See
+      // `convertInternalRowToCachedBatch` and #3456.
       rowBasedCachedBatchSerializer.convertCachedBatchToInternalRow(
         input,
         cacheAttributes,
@@ -811,7 +824,7 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
       cacheAttributes: Seq[Attribute],
       selectedAttributes: Seq[Attribute],
       conf: SQLConf): RDD[ColumnarBatch] = {
-    if (!validateSchema(cacheAttributes) || !schemaHeuristic(cacheAttributes)) {
+    if (!supportsSchema(cacheAttributes)) {
       // See `convertCachedBatchToInternalRow` for why both gates must match the
       // write side.
       rowBasedCachedBatchSerializer.convertCachedBatchToColumnarBatch(
