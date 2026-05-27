@@ -146,10 +146,8 @@ function apply_compilation_fixes {
     SUDO_CMD="sudo"
   fi
   $SUDO_CMD cp ${CURRENT_DIR}/modify_arrow.patch ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/
-  $SUDO_CMD cp ${CURRENT_DIR}/modify_arrow_dataset_scan_option.patch ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/
 
   git add ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/modify_arrow.patch # to avoid the file from being deleted by git clean -dffx :/
-  git add ${VELOX_HOME}/CMake/resolve_dependency_modules/arrow/modify_arrow_dataset_scan_option.patch # to avoid the file from being deleted by git clean -dffx :/
 }
 
 function setup_linux {
