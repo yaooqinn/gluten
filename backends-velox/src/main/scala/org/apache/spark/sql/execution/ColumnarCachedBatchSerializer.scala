@@ -56,6 +56,8 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.util.Arrays
 
+import scala.util.control.NonFatal
+
 /**
  * A Velox columnar cache batch carrying per-partition column statistics.
  *
@@ -955,9 +957,13 @@ class ColumnarCachedBatchSerializer extends SimpleMetricsCachedBatchSerializer
 
 object ColumnarCachedBatchSerializer extends Logging {
   // Encapsulates the per-batch serializeWithStats fast path so the catch arms can
-  // be exercised in unit tests with a stubbed jni wrapper. The fallback closure is
-  // invoked when the fast path throws UnsatisfiedLinkError (capability gone — also
-  // trips the JVM-lifetime latch via markStatsExtUnavailable).
+  // be exercised in unit tests with a stubbed jni wrapper. Two-arm catch:
+  //   - UnsatisfiedLinkError trips the JVM-lifetime capability latch via
+  //     markStatsExtUnavailable (one-way; native symbol gone for the whole JVM).
+  //   - NonFatal absorbs per-batch corruption (corrupt magic, truncated frame,
+  //     Kryo decode failure) without tripping the latch; the next batch retries
+  //     the fast path. A separate counter (warnCorruptStatsFrame) caps the
+  //     warning floor so high-throughput workloads don't drown the executor log.
   private[execution] def serializeOneBatchWithStats(
       jni: ColumnarBatchSerializerJniWrapper,
       handle: Long,
@@ -973,6 +979,34 @@ object ColumnarCachedBatchSerializer extends Logging {
       case e: UnsatisfiedLinkError =>
         markStatsExtUnavailable(e)
         fallbackToLegacy()
+      case NonFatal(e) =>
+        warnCorruptStatsFrame(e)
+        fallbackToLegacy()
+    }
+  }
+
+  // Per-JVM cap on corrupt-frame warnings to avoid log flooding when a native
+  // regression produces malformed frames batch after batch. Capability latch is
+  // intentionally NOT tripped here: a corrupt frame is a per-batch event, not a
+  // capability loss, and the next batch should still attempt the fast path.
+  private val corruptFrameWarnCount = new java.util.concurrent.atomic.AtomicLong(0L)
+  private val CORRUPT_FRAME_WARN_CAP = 100L
+
+  def warnCorruptStatsFrame(cause: Throwable): Unit = {
+    val n = corruptFrameWarnCount.incrementAndGet()
+    if (n <= CORRUPT_FRAME_WARN_CAP) {
+      logWarning(
+        s"serializeWithStats produced a corrupt/undecodable frame for one cached batch; " +
+          s"falling back to legacy serialize() for this batch (stats=null). Capability " +
+          s"latch unchanged. [$n/$CORRUPT_FRAME_WARN_CAP]",
+        cause
+      )
+      if (n == CORRUPT_FRAME_WARN_CAP) {
+        logWarning(
+          s"Further corrupt-frame warnings suppressed for the JVM lifetime " +
+            s"(cap=$CORRUPT_FRAME_WARN_CAP reached). Capability latch remains active; " +
+            s"investigate native serializeWithStats output.")
+      }
     }
   }
 
@@ -994,11 +1028,5 @@ object ColumnarCachedBatchSerializer extends Logging {
         cause
       )
     }
-  }
-
-  // Visible for testing: reset the capability flag so a unit test can re-exercise the
-  // probe-once semantics.
-  private[execution] def resetStatsExtAvailableForTesting(): Unit = {
-    statsExtAvailableFlag = true
   }
 }
